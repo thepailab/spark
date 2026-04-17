@@ -1,7 +1,6 @@
 suppressPackageStartupMessages(library(data.table))
 suppressPackageStartupMessages(library(dplyr))
 suppressPackageStartupMessages(library(optparse))
-suppressPackageStartupMessages(library(R.utils))
 
 option_list = list(
   make_option(c("--tsv"), type="character", default=NULL, 
@@ -47,9 +46,19 @@ insert_size <- c(as.numeric(insert_size_split[1]), as.numeric(insert_size_split[
 file <- opt$tsv
 
 file_importer <- function(file){
+  # Use data.table to quickly load, intentionally dropping strings if present
   full_reads <- data.table::fread(file=file, sep = '\t', header = T, stringsAsFactors = FALSE)
   full_reads$transcript_id <- as.numeric(1:nrow(full_reads))
-  full_reads$sequence_length <- nchar(full_reads$full_molecule_sequence)
+  
+  if (!"sequence_length" %in% names(full_reads)) {
+      stop("sequence_length column missing. Ensure upstream scripts are updated.")
+  }
+  
+  # Clean up memory immediately if strings are present
+  if ("full_molecule_sequence" %in% names(full_reads)) {
+      full_reads[, full_molecule_sequence := NULL]
+  }
+  
   return(full_reads)
 }
 
@@ -152,15 +161,8 @@ get_reads <- function(lengths, eta_val = 200, insert_size, transcript_id, no_fra
   return(fragments)
 }
 
-
-random_string_gen <- function(n = 5000) {
-  a <- do.call(paste0, replicate(5, sample(LETTERS, n, TRUE), FALSE))
-  paste0(a, sprintf("%04d", sample(9999, n, TRUE)), sample(LETTERS, n, TRUE))
-}
-
 full_reads <- file_importer(file)
 gene_id <- sub(".*\\/([A-Z]+[0-9]+(?:_[a-z]+)?)\\.tsv\\.gz$", "\\1", file)
-
 
 list_with_all_fragments <- lapply(seq_len(nrow(full_reads)), function(i) {
   get_reads(lengths = full_reads$sequence_length[i],
@@ -171,8 +173,6 @@ list_with_all_fragments <- lapply(seq_len(nrow(full_reads)), function(i) {
 })
 
 reads_list <- dplyr::bind_rows(list_with_all_fragments,.id = 'transcript_id')
-
-reads_list_all_fragments <- reads_list
 reads_list <- reads_list[reads_list$size_selection=='passed_size_selection',]
 
 
@@ -184,19 +184,15 @@ if (nrow(reads_list)>10){
   
   reads_list <- reads_list %>% dplyr::filter(read_end-read_start>10)
   
-  reads_list <- reads_list %>%
+  reads_list_collapsed <- reads_list %>%
     dplyr::mutate(read_coordinate = paste0(read_start, "-", read_end)) %>%
     dplyr::group_by(transcript_id) %>%
     dplyr::summarise(read_coordinates = paste(read_coordinate, collapse = ","), .groups = "drop")
   
-  
-  full_reads$transcript_id <- as.numeric(full_reads$transcript_id)
-  reads_list$transcript_id <- as.numeric(reads_list$transcript_id)
-  
-  full_reads <- merge(full_reads,reads_list,by='transcript_id')
-  
   temp_dir <- paste(opt$dir_out,'/temp/mRNAs_with_fragments',sep = '')
   dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
   path_for_file <- paste(temp_dir,'/',gene_id,'_fragments.tsv',sep = '')
-  fwrite(full_reads,path_for_file,sep = '\t',col.names = T,row.names = F,quote = F)
+  
+  # Strictly write the collapsed coordinates mapping (no redundant metadata overhead)
+  fwrite(reads_list_collapsed, path_for_file, sep = '\t', col.names = T, row.names = F, quote = F)
 }

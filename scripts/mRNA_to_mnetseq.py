@@ -5,29 +5,27 @@ import os
 import numpy as np
 import gzip
 
-def chop_sequence_bg(seq):
+def chop_sequence_bg_coords(seq_len):
     """
-    Chops a random fragment (35-100nt) from a background sequence.
-    Returns: (start, end, fragment_string)
+    Determines coordinates for a random fragment (35-100nt) from a background sequence.
+    Returns: (start_pos, end_pos)
     """
-    seq_len = len(seq)
     fragment_length = random.randint(35, 100)
     
     # If sequence is shorter than fragment length, take the whole thing
     if seq_len <= fragment_length:
-        return 0, seq_len, seq
+        return 0, seq_len
 
     max_start_pos = seq_len - fragment_length
     start_pos = random.randint(0, max_start_pos)
     end_pos = start_pos + fragment_length
-    return start_pos, end_pos, seq[start_pos:end_pos]
+    return start_pos, end_pos
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="convert mRNAs to mNET-seq fragments")
     parser.add_argument("--input_df", help="full path to the mRNA dataframe")
     parser.add_argument("--o", type=str, default="./", help="output path")
     parser.add_argument("--seed", type=int, help="random seed for reproducibility")
-    # New argument to control background proportion
     parser.add_argument("--bkg_molecules", type=float, default=0.0, 
                         help="Proportion of total reads that should be background (0.0 to 1.0). Default 0.")
 
@@ -38,7 +36,7 @@ if __name__ == "__main__":
     base_filename = filename.split(".")[0]
     output_filename = os.path.join(args.o, base_filename + "_mnetseq.tsv.gz")
 
-    if args.seed:
+    if args.seed is not None:
         np.random.seed(args.seed)
         random.seed(args.seed)
 
@@ -54,10 +52,10 @@ if __name__ == "__main__":
         # Fallback if file missing (though logic implies it should exist)
         max_length = float('inf')
 
-    # Prepare Output File (Write Header)
+    # Prepare Output File (Write Header without 'parsed_sequence')
     output_columns = [
         "initiation_time", "molecule_id", "strand", "sub_rate_percent_range",
-        "fragment_start_pos", "fragment_end_pos", "parsed_sequence"
+        "fragment_start_pos", "fragment_end_pos"
     ]
 
     with gzip.open(output_filename, 'wt') as f_out:
@@ -66,7 +64,7 @@ if __name__ == "__main__":
         # ==========================================
         # PART 1: Process Main Gene Molecules
         # ==========================================
-        print(f"[mNET-seq] Processing main gene: {base_filename}")
+        print(f"[mNET-seq] Processing main gene coordinates: {base_filename}")
         
         # Load main dataframe
         df = pd.read_csv(args.input_df, sep="\t", comment="#")
@@ -74,39 +72,33 @@ if __name__ == "__main__":
         # Filter: remove mRNAs that are done elongating
         df = df[df['stop_label_pos'] < (max_length - 1)].copy()
 
-        # Vectorized offset calculation
-        # Mnase digestion lengths (35-100)
+        # Vectorized offset calculation for Mnase digestion lengths (35-100)
         random_offsets = np.random.randint(35, 101, size=len(df))
 
         # Calculate positions
         df["fragment_start_pos"] = (df["stop_label_pos"] - random_offsets).clip(lower=0)
         df["fragment_end_pos"] = df["stop_label_pos"]
         
-        # Count valid gene fragments
-        gene_fragment_count = 0
+        # Mathematically ensure the fragment is longer than 10nt
+        df["frag_len"] = df["fragment_end_pos"] - df["fragment_start_pos"]
+        df_valid = df[df["frag_len"] > 10]
+        
+        gene_fragment_count = len(df_valid)
 
         # Iterate and write immediately (Streaming)
-        # This prevents storing the generated sequences in memory
-        for row in df.itertuples():
-            # Extract substring
-            # Note: Pandas slicing is inclusive-exclusive, string slicing is inclusive-exclusive
-            seq_slice = row.full_molecule_sequence[row.fragment_start_pos : row.fragment_end_pos]
-            
-            # Only keep fragments longer than 10nt
-            if len(seq_slice) > 10:
-                gene_fragment_count += 1
-                f_out.write(
-                    f"{row.initiation_time}\t"
-                    f"{row.molecule_id}\t"
-                    f"{row.strand}\t"
-                    f"{row.sub_rate_percent_range}\t"
-                    f"{row.fragment_start_pos}\t"
-                    f"{row.fragment_end_pos}\t"
-                    f"{seq_slice}\n"
-                )
+        for row in df_valid.itertuples():
+            f_out.write(
+                f"{row.initiation_time}\t"
+                f"{row.molecule_id}\t"
+                f"{row.strand}\t"
+                f"{row.sub_rate_percent_range}\t"
+                f"{row.fragment_start_pos}\t"
+                f"{row.fragment_end_pos}\n"
+            )
         
         # Free memory of main df
         del df
+        del df_valid
 
         # ==========================================
         # PART 2: Process Background Molecules
@@ -117,22 +109,19 @@ if __name__ == "__main__":
             if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
                 
                 # Calculate required background count
-                # n_bg = n_gene * (P / (1-P))
                 if gene_fragment_count > 0 and args.bkg_molecules < 1.0:
                     ratio = args.bkg_molecules / (1.0 - args.bkg_molecules)
                     reads_to_get_bg = int(gene_fragment_count * ratio)
                 elif args.bkg_molecules >= 1.0:
-                     # If only background requested or no gene reads found
-                     reads_to_get_bg = 1000 # Default fallback
+                     reads_to_get_bg = 1000 
                 else:
                     reads_to_get_bg = 0
 
                 if reads_to_get_bg > 0:
-                    print(f"[mNET-seq] Adding {reads_to_get_bg} background molecules...")
+                    print(f"[mNET-seq] Adding {reads_to_get_bg} background coordinate footprints...")
                     
                     df_bg = pd.read_csv(path_to_BGmRNAs, sep="\t", comment="#")
                     
-                    # If we need more reads than we have BG molecules, we sample with replacement
                     if len(df_bg) >= reads_to_get_bg:
                         bg_sample = df_bg.sample(n=reads_to_get_bg, replace=False)
                     else:
@@ -142,7 +131,9 @@ if __name__ == "__main__":
                     for row in bg_sample.itertuples():
                         mol_id = str(row.molecule_id) + '_BG_'
                         
-                        fstart, fend, fseq = chop_sequence_bg(row.full_molecule_sequence)
+                        # Use the sequence_length column to determine bounds mathematically
+                        seq_len = getattr(row, 'sequence_length', 1000) 
+                        fstart, fend = chop_sequence_bg_coords(seq_len)
                         
                         f_out.write(
                             f"{row.initiation_time}\t"
@@ -150,7 +141,6 @@ if __name__ == "__main__":
                             f"{row.strand}\t"
                             f"{row.sub_rate_percent_range}\t"
                             f"{fstart}\t"
-                            f"{fend}\t"
-                            f"{fseq}\n"
+                            f"{fend}\n"
                         )
                     del df_bg

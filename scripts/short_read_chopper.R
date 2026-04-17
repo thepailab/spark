@@ -1,7 +1,6 @@
 suppressPackageStartupMessages(library(data.table))
 suppressPackageStartupMessages(library(dplyr))
 suppressPackageStartupMessages(library(optparse))
-suppressPackageStartupMessages(library(R.utils))
 
 option_list = list(
   make_option(c("--tsv"), type="character", default=NULL, 
@@ -49,9 +48,19 @@ insert_size <- c(as.numeric(insert_size_split[1]), as.numeric(insert_size_split[
 file <- opt$tsv
 
 file_importer <- function(file){
+  # Use data.table to quickly load, intentionally dropping strings if present
   full_reads <- data.table::fread(file=file, sep = '\t', header = T, stringsAsFactors = FALSE)
   full_reads$transcript_id <- as.numeric(1:nrow(full_reads))
-  full_reads$sequence_length <- nchar(full_reads$full_molecule_sequence)
+  
+  if (!"sequence_length" %in% names(full_reads)) {
+      stop("sequence_length column missing. Ensure upstream scripts are updated.")
+  }
+  
+  # Clean up memory immediately if strings are present
+  if ("full_molecule_sequence" %in% names(full_reads)) {
+      full_reads[, full_molecule_sequence := NULL]
+  }
+  
   return(full_reads)
 }
 
@@ -67,24 +76,18 @@ get_reads <- function(lengths, eta_val = 200, insert_size, transcript_id, no_fra
     )
     
     if (sizeselectiontype == 'none') {
-      if (fragments$length >= 1) {
-        fragments$size_selection <- 'passed_size_selection'
-      }
+      if (fragments$length >= 1) fragments$size_selection <- 'passed_size_selection'
     } else if (sizeselectiontype == 'probabilistic') {
       p_left <- 1 / (1 + exp(-0.1 * (fragments$length - insert_size[1])))
       p_right <- 1 / (1 + exp(0.1 * (fragments$length - insert_size[2])))
       prob_keep <- p_left * p_right
-      if (runif(1) <= prob_keep) {
-        fragments$size_selection <- 'passed_size_selection'
-      }
+      if (runif(1) <= prob_keep) fragments$size_selection <- 'passed_size_selection'
     } else {
       if (fragments$length >= insert_size[1] && fragments$length <= insert_size[2]) {
         fragments$size_selection <- 'passed_size_selection'
       }
     }
-    
     fragments$length <- NULL 
-    
     return(fragments)
   }
   
@@ -120,17 +123,8 @@ get_reads <- function(lengths, eta_val = 200, insert_size, transcript_id, no_fra
     read_end = unlist(ends)
   )
   
-  first_row <- data.frame(
-    transcript_id = fragments$transcript_id[1],
-    read_start = 1,
-    read_end = fragments$read_start[1]
-  )
-  
-  last_row <- data.frame(
-    transcript_id = fragments$transcript_id[nrow(fragments)],
-    read_start = fragments$read_end[nrow(fragments)],
-    read_end = lengths
-  )
+  first_row <- data.frame(transcript_id = fragments$transcript_id[1], read_start = 1, read_end = fragments$read_start[1])
+  last_row <- data.frame(transcript_id = fragments$transcript_id[nrow(fragments)], read_start = fragments$read_end[nrow(fragments)], read_end = lengths)
   
   fragments <- rbind(first_row, fragments, last_row)
   fragments$length <- fragments$read_end - fragments$read_start
@@ -150,14 +144,26 @@ get_reads <- function(lengths, eta_val = 200, insert_size, transcript_id, no_fra
   }
   
   fragments$length <- NULL
-  
   return(fragments)
 }
 
-random_string_gen <- function(n = 5000) {
-  a <- do.call(paste0, replicate(5, sample(LETTERS, n, TRUE), FALSE))
-  paste0(a, sprintf("%04d", sample(9999, n, TRUE)), sample(LETTERS, n, TRUE))
+# --- Fast Vectorized Coverage Function ---
+calculate_coverage_fast <- function(starts, ends, multiplier = 1) {
+  max_pos <- max(ends)
+  change_vec <- numeric(max_pos + 2)
+  
+  start_counts <- table(starts)
+  end_counts <- table(ends + 1)
+  
+  change_vec[as.integer(names(start_counts))] <- as.integer(start_counts)
+  change_vec[as.integer(names(end_counts))] <- change_vec[as.integer(names(end_counts))] - as.integer(end_counts)
+  
+  freq_vec <- cumsum(change_vec)[1:max_pos]
+  
+  freq_table <- data.table(position = 1:max_pos, frequency = freq_vec * multiplier)
+  return(freq_table[frequency > 0])
 }
+# -----------------------------------------
 
 full_reads <- file_importer(file)
 gene_id <- sub(".*/(ENSG[0-9]+(?:_background)?)(?:\\.tsv\\.gz)$", "\\1", file)
@@ -170,80 +176,60 @@ list_with_all_fragments <- lapply(seq_len(nrow(full_reads)), function(i) {
             sizeselectiontype = opt$sizeselectiontype)
 })
 
-reads_list <- dplyr::bind_rows(list_with_all_fragments,.id = 'transcript_id')
-
+reads_list <- dplyr::bind_rows(list_with_all_fragments, .id = 'transcript_id')
 reads_list_all_fragments <- reads_list
-reads_list <- reads_list[reads_list$size_selection=='passed_size_selection',]
+reads_list <- reads_list[reads_list$size_selection == 'passed_size_selection', ]
 
-
-if (nrow(reads_list)>10){ 
+if (nrow(reads_list) > 10){ 
   reads_list$transcript_id <- as.numeric(reads_list$transcript_id)
   gene_length <- mean(full_reads$sequence_length)/1000
   gene_tpm <- runif(n=1, min=as.integer(opt$tpm_lower_limit), max=as.integer(opt$tpm_upper_limit))
-  seq_depth <- opt$seq_depth/10^6
+  seq_depth <- opt$seq_depth / 10^6
   
-  reads_to_get <- gene_length*gene_tpm*seq_depth
+  reads_to_get <- gene_length * gene_tpm * seq_depth
   
   reads_list$read_start <- as.integer(reads_list$read_start)
   reads_list$read_end <- as.integer(reads_list$read_end)
   
-  if (opt$fragments=='with_ground_truth'){
-    all_positions_selected <- unlist(mapply(seq, reads_list$read_start, reads_list$read_end))
-    freq_table_selected <- as.data.table(table(all_positions_selected))
-    setnames(freq_table_selected, c("position", "frequency"))
-    freq_table_selected[, position := as.integer(as.character(position))]
+  # --- Post-Selection Ground Truth ---
+  if (opt$fragments == 'with_ground_truth'){
+    # Use fast vectorized math instead of sequence expansion
+    freq_table_selected <- calculate_coverage_fast(reads_list$read_start, reads_list$read_end)
     
-    dir_ground_truth <- paste(opt$dir_out,'/ground_truth_after_size_selection',sep = '')
+    dir_ground_truth <- paste(opt$dir_out, '/ground_truth_after_size_selection', sep = '')
     dir.create(dir_ground_truth, showWarnings = FALSE, recursive = TRUE)
-    path_for_file <- paste(dir_ground_truth,'/',gene_id,'.tsv.gz',sep = '')
-    fwrite(freq_table_selected,path_for_file,sep = '\t',col.names = T,row.names = F,quote = F,compress = 'gzip')
+    path_for_file <- paste(dir_ground_truth, '/', gene_id, '.tsv.gz', sep = '')
+    fwrite(freq_table_selected, path_for_file, sep = '\t', col.names = T, row.names = F, quote = F, compress = 'gzip')
   }
-  
   
   reads_list_collapsed <- reads_list %>%
     dplyr::mutate(read_coordinate = paste0(read_start, "-", read_end)) %>%
     dplyr::group_by(transcript_id) %>%
     dplyr::summarise(read_coordinates = paste(read_coordinate, collapse = ","), .groups = "drop")
   
-  if (opt$fragments=='with_ground_truth'){
+  # --- Pre-Selection Ground Truth ---
+  if (opt$fragments == 'with_ground_truth'){
     
-    n_passed <- nrow(reads_list_all_fragments[reads_list_all_fragments$size_selection=='passed_size_selection',])
+    n_passed <- nrow(reads_list_all_fragments[reads_list_all_fragments$size_selection == 'passed_size_selection',])
     if(n_passed == 0) {
-      ratio_total_passed <- 0
+      scaling_factor <- 0
     } else {
-      ratio_total_passed <- nrow(reads_list_all_fragments)/n_passed
+      # Instead of looping 100 times to approximate expectation, scale mathematically:
+      # (Target fragments / Total available pre-selection fragments)
+      scaling_factor <- reads_to_get / n_passed
     }
     
-    all_fragments_to_get <- reads_to_get
+    final_freqs <- calculate_coverage_fast(reads_list_all_fragments$read_start, reads_list_all_fragments$read_end, multiplier = scaling_factor)
     
-    all_sampling <- data.frame()
-    for (j in 1:100){
-      if (nrow(reads_list_all_fragments)>=all_fragments_to_get){
-        reads_list_all_fragments_sampled <- dplyr::sample_n(reads_list_all_fragments,size=all_fragments_to_get,replace = F) 
-      }else{
-        sampled_reads <- dplyr::sample_n(reads_list_all_fragments,size=all_fragments_to_get-nrow(reads_list_all_fragments),replace = T) 
-        reads_list_all_fragments_sampled <- rbind(reads_list_all_fragments,sampled_reads)
-      }
-      
-      all_positions <- unlist(mapply(seq, reads_list_all_fragments_sampled$read_start, reads_list_all_fragments_sampled$read_end))
-      freq_table <- as.data.table(table(all_positions))
-      setnames(freq_table, c("position", "frequency"))
-      freq_table[, position := as.integer(as.character(position))]
-      all_sampling <- rbind(all_sampling,freq_table)
-    }
-    final_freqs <- all_sampling %>% dplyr::group_by(position) %>% dplyr::reframe(frequency=mean(frequency))
-    final_freqs <- final_freqs[-nrow(final_freqs),]
-    
-    dir_ground_truth <- paste(opt$dir_out,'/ground_truth_pre_size_selection',sep = '')
+    dir_ground_truth <- paste(opt$dir_out, '/ground_truth_pre_size_selection', sep = '')
     dir.create(dir_ground_truth, showWarnings = FALSE, recursive = TRUE)
-    path_for_file <- paste(dir_ground_truth,'/', gene_id,'.tsv.gz',sep = '')
-    fwrite(final_freqs,path_for_file,sep = '\t',col.names = T,row.names = F,quote = F,compress = 'gzip')
+    path_for_file <- paste(dir_ground_truth, '/', gene_id, '.tsv.gz', sep = '')
+    fwrite(final_freqs, path_for_file, sep = '\t', col.names = T, row.names = F, quote = F, compress = 'gzip')
   }
   
-  temp_dir <- paste(opt$dir_out,'/temp/mRNAs_with_fragments',sep = '')
+  temp_dir <- paste(opt$dir_out, '/temp/mRNAs_with_fragments', sep = '')
   dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
-  path_for_file <- paste(temp_dir,'/',gene_id,'_fragments.tsv',sep = '')
+  path_for_file <- paste(temp_dir, '/', gene_id, '_fragments.tsv', sep = '')
   
   fwrite(reads_list_collapsed, path_for_file, sep = '\t', col.names = T, row.names = F, quote = F)
-  
 }

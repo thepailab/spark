@@ -4,251 +4,220 @@ import random
 import argparse
 import os
 import subprocess
-import shutil
 import string
-import ast
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def run_cmd(cmd):
-    print(f"[Running] {cmd}")
     subprocess.run(cmd, shell=True, check=True)
-
 
 def make_random_suffix(length=5):
     return ''.join(random.choices(string.ascii_lowercase, k=length))
 
-
-def extract_sequence_regions(df, read_length):
-    df = df.copy()
-    # Ensure converted_positions and incorporated_positions are lists of ints
-    # Extract sequence after fragmentation
-    # Extract read sequences
-
-    df['read_upstream'] = df.apply(
-        lambda row: row['parsed_sequence'][:read_length] if len(row['parsed_sequence']) >= read_length else row['parsed_sequence'],
-        axis=1
-    )
-    df['read_downstream'] = df.apply(
-        lambda row: row['parsed_sequence'][-read_length:] if len(row['parsed_sequence']) >= read_length else row['parsed_sequence'],
-        axis=1
-    )
-
-    return df
-
-
 def reverse_complement(seq):
-    """Return the reverse complement of a DNA sequence."""
     complement = str.maketrans('ACGTacgt', 'TGCAtgca')
     return seq.translate(complement)[::-1]
 
-
 def process_sequence(sequence, reverse_comp=False):
-    """Process sequence by reversing and complementing if needed."""
     return reverse_complement(sequence) if reverse_comp else sequence
 
+def get_absolute_coords(rates_df, read_start, read_end):
+    if rates_df.empty:
+        return "NA"
+    subset = rates_df[
+        (rates_df['nucleotide_coord'] >= read_start) &
+        (rates_df['nucleotide_coord'] <= read_end)
+    ]
+    if not subset.empty:
+        chrom = subset['chromosome'].iloc[0]
+        abs_start = subset['absolute_position'].iloc[0]
+        abs_end = subset['absolute_position'].iloc[-1]
+        strand = subset['strand'].iloc[0]
+        return f"{chrom}:{abs_start}-{abs_end}:{strand}"
+    return "NA"
 
-def convert_to_fastq(df, output_prefix, sequencing_type, strandedness, read_length, rates_df, ttseq=False):
-
-    def get_sequences(row, which):
-        # Always return a list of sequences
-        seqs = row[which]
-        if isinstance(seqs, list):
-            return seqs
-        elif isinstance(seqs, str):
-            return [seqs]
-        else:
-            return []
-
-    def get_absolute_coords(fragment_start_pos, fragment_end_pos):
-        subset = rates_df[
-            (rates_df['nucleotide_coord'] >= fragment_start_pos) &
-            (rates_df['nucleotide_coord'] <= fragment_end_pos)
-        ]
-        if not subset.empty:
-            chrom = subset['chromosome'].iloc[0]
-            abs_start = subset['absolute_position'].iloc[0]
-            abs_end = subset['absolute_position'].iloc[-1]
-            strand = subset['strand'].iloc[0]
-            return f"{chrom}:{abs_start}-{abs_end}:{strand}"
-        else:
-            return "NA"
-
+def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, read_length, rates_df, ref_arr, bg_ref_arr):
     if sequencing_type == "SE":
         output_file = f"{output_prefix}.fastq.gz"
         with gzip.open(output_file, 'wt') as f:
-            for _, row in df.iterrows():
+            for row in df.itertuples():
+                frag_start = int(row.fragment_start_pos)
+                frag_end = int(row.fragment_end_pos)
+                
+                is_bg = "_BG_" in str(row.molecule_id)
+                current_ref = bg_ref_arr if is_bg else ref_arr
+                
+                frag_end = min(frag_end, len(current_ref))
+                frag_start = min(frag_start, frag_end)
+
                 if strandedness == "rf":
-                    seqs = get_sequences(row, 'read_downstream')
-                    which_read = "downstream"
+                    d_start = max(0, frag_end - read_length)
+                    seq = "".join(current_ref[d_start:frag_end])
                     rev = True
-                    abs_coords = get_absolute_coords(max(0, row['fragment_end_pos'] - read_length), row['fragment_end_pos'] - 1)
+                    abs_coords = get_absolute_coords(rates_df, d_start, frag_end - 1)
                 elif strandedness == "fr":
-                    seqs = get_sequences(row, 'read_upstream')
-                    which_read = "upstream"
+                    u_end = min(frag_start + read_length, frag_end)
+                    seq = "".join(current_ref[frag_start:u_end])
                     rev = False
-                    abs_coords = get_absolute_coords(row['fragment_start_pos'], row['fragment_start_pos'] + read_length - 1)
+                    abs_coords = get_absolute_coords(rates_df, frag_start, u_end - 1)
                 elif strandedness == "unstranded":
                     if random.choice([True, False]):
-                        seqs = get_sequences(row, 'read_downstream')
-                        which_read = "downstream"
+                        d_start = max(0, frag_end - read_length)
+                        seq = "".join(current_ref[d_start:frag_end])
                         rev = True
-                        abs_coords = get_absolute_coords(max(0, row['fragment_end_pos'] - read_length), row['fragment_end_pos'] - 1)
+                        abs_coords = get_absolute_coords(rates_df, d_start, frag_end - 1)
                     else:
-                        seqs = get_sequences(row, 'read_upstream')
-                        which_read = "upstream"
+                        u_end = min(frag_start + read_length, frag_end)
+                        seq = "".join(current_ref[frag_start:u_end])
                         rev = False
-                        abs_coords = get_absolute_coords(row['fragment_start_pos'], row['fragment_start_pos'] + read_length - 1)
+                        abs_coords = get_absolute_coords(rates_df, frag_start, u_end - 1)
 
-                for sequence in seqs:
-                    seq = process_sequence(sequence, reverse_comp=rev)
-                    random_suffix = make_random_suffix()
-                    read_name = (
-                        f"{row['molecule_id']}{random_suffix}"
-                        f"_{abs_coords}"
-                    )
+                seq = process_sequence(seq, reverse_comp=rev)
+                if not seq: continue
 
-                    quality_scores = "I" * len(seq)
-                    f.write(f"{read_name}\n{seq}\n+\n{quality_scores}\n")
+                random_suffix = make_random_suffix()
+                read_name = f"{row.molecule_id}{random_suffix}_{abs_coords}"
+                quality_scores = "I" * len(seq)
+                
+                f.write(f"{read_name}\n{seq}\n+\n{quality_scores}\n")
 
     elif sequencing_type == "PE":
         output_file_r1 = f"{output_prefix}_R1.fastq.gz"
         output_file_r2 = f"{output_prefix}_R2.fastq.gz"
+        
         with gzip.open(output_file_r1, 'wt') as f1, gzip.open(output_file_r2, 'wt') as f2:
-            for _, row in df.iterrows():
-                upstream_seqs = get_sequences(row, 'read_upstream')
-                downstream_seqs = get_sequences(row, 'read_downstream')
-                n_pairs = min(len(upstream_seqs), len(downstream_seqs))
+            for row in df.itertuples():
+                frag_start = int(row.fragment_start_pos)
+                frag_end = int(row.fragment_end_pos)
+                
+                is_bg = "_BG_" in str(row.molecule_id)
+                current_ref = bg_ref_arr if is_bg else ref_arr
+                
+                frag_end = min(frag_end, len(current_ref))
+                frag_start = min(frag_start, frag_end)
+                
+                u_end = min(frag_start + read_length, frag_end)
+                d_start = max(0, frag_end - read_length)
+                
+                seq_upstream = "".join(current_ref[frag_start:u_end])
+                seq_downstream = "".join(current_ref[d_start:frag_end])
+                
+                if strandedness == "rf":
+                    seq_r1 = process_sequence(seq_downstream, reverse_comp=True)
+                    seq_r2 = process_sequence(seq_upstream, reverse_comp=False)
+                    abs_coords_r1 = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                    abs_coords_r2 = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                elif strandedness == "fr":
+                    seq_r1 = process_sequence(seq_upstream, reverse_comp=False)
+                    seq_r2 = process_sequence(seq_downstream, reverse_comp=True)
+                    abs_coords_r1 = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                    abs_coords_r2 = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                elif strandedness == "unstranded":
+                    if random.choice([True, False]):
+                        seq_r1 = process_sequence(seq_downstream, reverse_comp=True)
+                        seq_r2 = process_sequence(seq_upstream, reverse_comp=False)
+                        abs_coords_r1 = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                        abs_coords_r2 = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                    else:
+                        seq_r1 = process_sequence(seq_upstream, reverse_comp=False)
+                        seq_r2 = process_sequence(seq_downstream, reverse_comp=True)
+                        abs_coords_r1 = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                        abs_coords_r2 = get_absolute_coords(rates_df, d_start, frag_end - 1)
 
-                for i in range(n_pairs):
-                    random_suffix = make_random_suffix()  # single suffix per pair
+                if not seq_r1 or not seq_r2: continue
 
-                    if strandedness == "rf":
-                        seq_r1 = process_sequence(downstream_seqs[i], reverse_comp=True)
-                        seq_r2 = process_sequence(upstream_seqs[i], reverse_comp=False)
-
-                        which_read_r1 = "downstream"
-                        which_read_r2 = "upstream"
-
-                        abs_coords_r1 = get_absolute_coords(max(0, row['fragment_end_pos'] - read_length), row['fragment_end_pos'] - 1)
-                        abs_coords_r2 = get_absolute_coords(row['fragment_start_pos'], row['fragment_start_pos'] + read_length - 1)
-
-                    elif strandedness == "fr":
-                        seq_r1 = process_sequence(upstream_seqs[i], reverse_comp=False)
-                        seq_r2 = process_sequence(downstream_seqs[i], reverse_comp=True)
-
-                        which_read_r1 = "upstream"
-                        which_read_r2 = "downstream"
-
-                        abs_coords_r1 = get_absolute_coords(row['fragment_start_pos'], row['fragment_start_pos'] + read_length - 1)
-                        abs_coords_r2 = get_absolute_coords(max(0, row['fragment_end_pos'] - read_length), row['fragment_end_pos'] - 1)
-
-                    elif strandedness == "unstranded":
-                        if random.choice([True, False]):
-                            seq_r1 = process_sequence(downstream_seqs[i], reverse_comp=True)
-                            seq_r2 = process_sequence(upstream_seqs[i], reverse_comp=False)
-
-                            which_read_r1 = "downstream"
-                            which_read_r2 = "upstream"
-
-                            abs_coords_r1 = get_absolute_coords(max(0, row['fragment_end_pos'] - read_length), row['fragment_end_pos'] - 1)
-                            abs_coords_r2 = get_absolute_coords(row['fragment_start_pos'], row['fragment_start_pos'] + read_length - 1)
-                        else:
-                            seq_r1 = process_sequence(upstream_seqs[i], reverse_comp=False)
-                            seq_r2 = process_sequence(downstream_seqs[i], reverse_comp=True)
-
-                            which_read_r1 = "upstream"
-                            which_read_r2 = "downstream"
-
-                            abs_coords_r1 = get_absolute_coords(row['fragment_start_pos'], row['fragment_start_pos'] + read_length - 1)
-                            abs_coords_r2 = get_absolute_coords(max(0, row['fragment_end_pos'] - read_length), row['fragment_end_pos'] - 1)
-
-                    random_suffix = make_random_suffix()
-                    read_name_r1 = (
-                        f"{row['molecule_id']}{random_suffix}_{abs_coords_r1}"
-                    )
-                    read_name_r2 = (
-                        f"{row['molecule_id']}{random_suffix}_{abs_coords_r2}"
-                    )
-                    quality_scores_r1 = "I" * len(seq_r1)
-                    quality_scores_r2 = "I" * len(seq_r2)
-                    f1.write(f"{read_name_r1}\n{seq_r1}\n+\n{quality_scores_r1}\n")
-                    f2.write(f"{read_name_r2}\n{seq_r2}\n+\n{quality_scores_r2}\n")
-
+                random_suffix = make_random_suffix()
+                read_name_r1 = f"{row.molecule_id}{random_suffix}_{abs_coords_r1}"
+                read_name_r2 = f"{row.molecule_id}{random_suffix}_{abs_coords_r2}"
+                
+                f1.write(f"{read_name_r1}\n{seq_r1}\n+\n{'I'*len(seq_r1)}\n")
+                f2.write(f"{read_name_r2}\n{seq_r2}\n+\n{'I'*len(seq_r2)}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="convert dataframe to FASTQ file.")
-    parser.add_argument("--input_df", help="full path to the input dataframe")
-    parser.add_argument("--insert_size", type=str, default="200,300", help="Length of insert")
-    parser.add_argument("--read_length", type=int, default=100, help="length of each read")
-    parser.add_argument("--seq_type", choices=["PE", "SE"], type=str, default='SE', help="Type of sequencing: SE or PE")
-    parser.add_argument("--s", choices=["rf", "fr", "unstranded"], type=str, default='rf', help="strandedness of the simulated library")
-    parser.add_argument('--seq_depth', type=int, default=20000000, help='total library sequencing depth')
-    parser.add_argument("--threads", type=int, default=1, help="Number of threads")
-    parser.add_argument('--tpm_lower_limit', type=int, default=5, help='lower possible CPM per gene')
-    parser.add_argument('--tpm_upper_limit', type=int, default=200, help='higher possible CPM per gene')
-    parser.add_argument('--o', type=str, default='./', help='output path')
-    parser.add_argument("--seed", type=int, help="random seed for reproducibility")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_df")
+    parser.add_argument("--insert_size", type=str, default="200,300")
+    parser.add_argument("--read_length", type=int, default=100)
+    parser.add_argument("--seq_type", choices=["PE", "SE"], type=str, default='SE')
+    parser.add_argument("--s", choices=["rf", "fr", "unstranded"], type=str, default='rf')
+    parser.add_argument('--seq_depth', type=int, default=20000000)
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument('--tpm_lower_limit', type=int, default=5)
+    parser.add_argument('--tpm_upper_limit', type=int, default=200)
+    parser.add_argument('--o', type=str, default='./')
+    parser.add_argument("--seed", type=int)
 
     args = parser.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
+        np.random.seed(args.seed)
 
     filename = os.path.splitext(os.path.basename(args.input_df))[0]
     base_filename = filename.split("_")[0]
     output_prefix = f"{args.o}/reads/{base_filename}"
     chopped_coordinates_file_path = f"{args.o}/mnetseqmRNAs/{base_filename}_mnetseq.tsv.gz"
-    mRNA_coordinates_file_path = f"{args.o}/mRNA/{base_filename}.tsv.gz"
+
+    gtf_path = f"{args.o}/gtf/{base_filename}.tsv.gz"
+    if os.path.exists(gtf_path):
+        df_gtf = pd.read_csv(gtf_path, delimiter="\t")
+        df_gtf = df_gtf.sort_values('position')
+        
+        ref_seq_full = "".join(df_gtf['sequence'].astype(str).tolist())
+        ref_arr = np.array(list(ref_seq_full), dtype='U1')
+        
+        is_bg_spliced = True
+        path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
+        
+        if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
+            try:
+                peek_df = pd.read_csv(path_to_BGmRNAs, delimiter="\t", nrows=1)
+                if 'sequence_length' in peek_df.columns and peek_df.iloc[0]['sequence_length'] == len(ref_seq_full):
+                    is_bg_spliced = False
+            except:
+                pass
+                
+        if is_bg_spliced:
+            exon_df = df_gtf[df_gtf['feature'] == 'exon'].copy()
+            bg_ref_seq_spliced = "".join(exon_df['sequence'].astype(str).tolist())
+            bg_ref_arr = np.array(list(bg_ref_seq_spliced), dtype='U1')
+            gene_length = exon_df["sequence"].str.len().sum() / 1000
+        else:
+            bg_ref_arr = ref_arr.copy()
+            gene_length = len(ref_seq_full) / 1000
+    else:
+        exit(1)
 
     try:
         df = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
         
-        #Bring in original mRNA lengths to calculate tpms as for other methods
-        df_mrna = pd.read_csv(mRNA_coordinates_file_path, delimiter="\t")
-        df_mrna["sequence_length"] = df_mrna["full_molecule_sequence"].str.len()
-        # mean of sequence_length column (divided by 1000)
-        #gene_length = df_mrna["sequence_length"].mean() / 1000
-        #Calculate exon length to scale reads
-        gtf_path = f"{args.o}/gtf/{base_filename}.tsv.gz"
-        df_gtf = pd.read_csv(gtf_path, delimiter="\t")
-        exon_df = df_gtf[df_gtf['feature'] == 'exon'].copy()
-
-        gene_length=exon_df["sequence"].str.len().sum()/1000
-
-        # random uniform value between tpm_lower_limit and tpm_upper_limit
-        gene_tpm = np.random.uniform(
-            low=int(args.tpm_lower_limit),
-            high=int(args.tpm_upper_limit)
-            )
-        # sequencing depth (divided by 1e6)
+        gene_tpm = np.random.uniform(low=int(args.tpm_lower_limit), high=int(args.tpm_upper_limit))
         seq_depth = args.seq_depth / 1e6
-        # number of fragments for the gene
         reads_to_get = gene_length * gene_tpm * seq_depth
 
         if len(df) >= reads_to_get:
-            df = df.sample(
-                n=int(reads_to_get), replace=False, random_state=None
-                )
+            df = df.sample(n=int(reads_to_get), replace=False, random_state=None)
         else:
-            sampled_reads = df.sample(
-                n=int(reads_to_get) - len(df), replace=True, random_state=None
-                )
-            # combine original and sampled
+            sampled_reads = df.sample(n=int(reads_to_get) - len(df), replace=True, random_state=None)
             df = pd.concat([df, sampled_reads], ignore_index=True)
 
-        result_df = extract_sequence_regions(df, args.read_length)
-
         rates_for_gene = f"{args.o}/rate_per_gene/{base_filename}_RatesandTraversalTimes.gtf"
-        rates_df = pd.read_csv(rates_for_gene, delimiter="\t")
-        convert_to_fastq(result_df, output_prefix, sequencing_type=args.seq_type, strandedness=args.s,
-                         read_length=args.read_length, rates_df=rates_df)
-        #convert_to_fastq(result_df, output_prefix, sequencing_type=args.seq_type, strandedness=args.s, gene_id=base_filename)
-        #try:
-        #    os.remove(chopped_coordinates_file_path)
-        #except OSError:
-        #    pass
+        if os.path.exists(rates_for_gene):
+            rates_df = pd.read_csv(rates_for_gene, delimiter="\t")
+        else:
+            rates_df = pd.DataFrame(columns=['nucleotide_coord', 'chromosome', 'absolute_position', 'strand'])
+
+        process_and_write_fastq(
+            df, 
+            output_prefix, 
+            args.seq_type, 
+            args.s, 
+            args.read_length, 
+            rates_df, 
+            ref_arr, 
+            bg_ref_arr
+        )
             
     except FileNotFoundError:
         pass

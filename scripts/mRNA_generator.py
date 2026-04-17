@@ -5,77 +5,62 @@ import os
 import string
 import numpy as np
 import zlib
-import hashlib  # Added for robust seeding
+import hashlib  
 
 # 1: Create the DNA sequence as a numpy array for fast slicing/mutation
 def getDNAseq_array(dna_sequence):
-    # Convert to numpy array of characters (unicode or bytes) for mutable operations
+    # Convert to numpy array of characters for fast coordinate finding
     return np.array(list(''.join(str(i) for i in dna_sequence)), dtype='U1')
 
 # 4: Optimized findStopnt
 def findStopnt_optimized(times_array, cumsum_times_padded, labeling_duration, startsite, rng):
-    # startsite is 1-based, convert to 0-based index
     idx_start = max(0, startsite - 1)
     
     start_time_mean = cumsum_times_padded[idx_start]
     target_time_mean = start_time_mean + labeling_duration
     
-    # Binary search on the Mean Cumulative Sums to find approximate end
     idx_approx = np.searchsorted(cumsum_times_padded, target_time_mean, side='left')
     
-    # Safety margin (20%)
     needed = idx_approx - idx_start
     idx_end_safe = min(len(times_array), idx_start + int(needed * 1.2) + 50)
     
-    # Only generate random jitters for this specific slice
     times_slice = times_array[idx_start : idx_end_safe]
     jitters = rng.uniform(0.9, 1.1, size=times_slice.size)
     total_times = np.cumsum(times_slice * jitters)
     
-    # Find exact stop in this slice
     idx_in_slice = np.searchsorted(total_times, labeling_duration, side="right")
     
     return startsite + idx_in_slice
 
-# 5 & 6: Combined & Vectorized Mutation Function
+# 5 & 6: Vectorized Coordinate Extractor (No String Manipulation)
 def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx, 
                           nt_inc_range, sub_rate_range, seq_err_range, 
                           from_base, to_base, rng):
-
     """
-    Generates the nascent RNA molecule.
-    1. Creates molecule from TSS (0) to read_stop_idx.
-    2. Labels only the region from label_start_idx to read_stop_idx.
-    3. Applies sequencing errors to the whole molecule.
+    Finds the coordinates for labeling and sequencing errors without 
+    materializing or mutating the string sequence.
     """
-    # 1. COPY the full nascent RNA (from 0 to Pol position)
-    # Ensure indices are valid
     stop_safe = min(len(seq_array_ref), read_stop_idx)
-    read_arr = seq_array_ref[0:stop_safe].copy()
-    
-    # 2. LABELING (Incorporation & Conversion)
-    # Only look at the segment that was transcribed during the labeling pulse
     lbl_start_safe = max(0, label_start_idx)
     
-    # If labeling started after transcription stopped (shouldn't happen, but safety first)
+    nt_inc_rate_val = 0.0
+    incorporated_absolute = []
+    converted_absolute = []
+    
+    # 1. LABELING (Incorporation & Conversion)
     if lbl_start_safe < stop_safe:
-        # We work on a 'view' of the array to modify it in place
-        label_view = read_arr[lbl_start_safe:stop_safe]
+        # Look at the segment transcribed during the pulse
+        label_view = seq_array_ref[lbl_start_safe:stop_safe]
         
-        # Find positions of the labeling base (e.g., 'T')
+        # Find local indices of the analog base (e.g., 'T')
         from_indices = np.where(label_view == from_base)[0]
         n_candidates = len(from_indices)
         
         nt_inc_rate_val = rng.uniform(nt_inc_range[0], nt_inc_range[1])
         n_inc = int(np.ceil(n_candidates * nt_inc_rate_val))
         
-        incorporated_absolute = []
-        converted_absolute = []
-        
         if n_inc > 0:
-            # Choose bases to incorporate label
             chosen_indices_rel = rng.choice(from_indices, size=n_inc, replace=False)
-            # Store absolute coordinates (relative to TSS)
             incorporated_absolute = (lbl_start_safe + chosen_indices_rel).tolist()
             
             # Conversion (e.g., T to C)
@@ -85,16 +70,10 @@ def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx,
                 
                 if n_conv > 0:
                     conv_indices_rel = rng.choice(chosen_indices_rel, size=n_conv, replace=False)
-                    # Apply mutation in-place
-                    label_view[conv_indices_rel] = to_base
                     converted_absolute = (lbl_start_safe + conv_indices_rel).tolist()
-    else:
-        nt_inc_rate_val = 0
-        incorporated_absolute = []
-        converted_absolute = []
 
-    # 3. SEQUENCING ERRORS (Apply to whole read)
-    read_len = len(read_arr)
+    # 2. SEQUENCING ERRORS (Determine random coordinates across the whole read)
+    read_len = stop_safe
     seq_err_rate = rng.uniform(seq_err_range[0], seq_err_range[1])
     n_err = rng.binomial(read_len, seq_err_rate)
     
@@ -102,29 +81,14 @@ def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx,
     if n_err > 0:
         err_locs = rng.choice(read_len, size=n_err, replace=False)
         seq_err_absolute = [int(x) for x in err_locs]
-        
-        bases = np.array(['A', 'C', 'G', 'T'])
-        # Simple loop is fast enough for small error rates
-        for loc in err_locs:
-            orig = read_arr[loc]
-            poss = bases[bases != orig]
-            read_arr[loc] = rng.choice(poss)
-
-    # Convert back to string
-    final_seq = "".join(read_arr)
     
-    return final_seq, nt_inc_rate_val, converted_absolute, incorporated_absolute, seq_err_rate, seq_err_absolute
+    return nt_inc_rate_val, converted_absolute, incorporated_absolute, seq_err_rate, seq_err_absolute
 
 # 8: Bulk ID Generator
 def generate_ids_bulk(n, size=12, rng=None):
     chars = list(string.ascii_uppercase + string.digits)
     rand_chars = rng.choice(chars, (n, size-1))
     return ["@" + "".join(row) for row in rand_chars]
-
-def createOutputName(gtf_file, label_time, bkgd_perc_range, u2c_perc_range, num_reads):
-    gtf_name = gtf_file.strip(".gtf")
-    output_file_name = str(gtf_name) + "_l" + str(label_time) + "_b" + str(bkgd_perc_range) + "_p" + str(u2c_perc_range) + "_reads" + str(num_reads) + ".csv.gz"
-    return output_file_name
 
 if __name__ == "__main__":
 
@@ -148,42 +112,26 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # --- UPDATED SEEDING LOGIC START ---
-    # 1. We must read the dataframe FIRST to get the coordinates.
     df = pd.read_csv(args.region_file, sep='\t', comment='#')
     df.columns = ["chromosome", 'absolute_start', 'absolute_end', "region_start_coord", "region_end_coord", 'strand', "rate_initial", "rate_final", "rate_change_per_nt", "time_to_traverse", "sequence"]
 
-    # 2. Generate seed based on GENOMIC COORDINATES (content) rather than filename.
-    # This ensures that even if filenames are identical (e.g. 'tmp.gtf'), different genes get different seeds.
     if args.seed is not None:
-        # Create a unique biological signature: Chr_Start_End
-        # We access the first row (iloc[0]) since this file represents one region/gene
         gene_signature = f"{df.iloc[0]['chromosome']}_{df.iloc[0]['absolute_start']}_{df.iloc[0]['absolute_end']}"
-        
-        # Use SHA256 for a robust hash of this signature
         hasher = hashlib.sha256(gene_signature.encode('utf-8'))
         gene_content_hash = int(hasher.hexdigest(), 16)
-        
-        # Combine the user's base seed with the biological hash
         unique_seed = (args.seed + gene_content_hash) % (2**32)
-    
         np.random.seed(unique_seed)
         rng = np.random.default_rng(unique_seed)
-    
     else:
         rng = np.random.default_rng()
-    # --- UPDATED SEEDING LOGIC END ---
 
     nt_incorporation_rate = list(map(float, args.nt_inc_rate.split(',')))
     sub_rate_percent_range = list(map(float, args.subs_rate.split(',')))
     seqerr_range = list(map(float, args.seq_err.split(',')))
-
-    # df is already loaded above
     
     df_nt = pd.read_csv(args.nt_file, sep='\t', comment='#')
     df_nt.columns = ["chromosome", "absolute_position", 'strand', "region_number", "nucleotide_coord", "time_for_this_nt", "rate_for_this_nt", "rate_change_per_nt"]
     
-    # OPTIMIZATION: Pre-process sequence and times
     dna_sequence_arr = getDNAseq_array(df.sequence)
     times_raw = df_nt['time_for_this_nt'].values
     cumsum_times_padded = np.concatenate(([0], np.cumsum(times_raw)))
@@ -193,10 +141,8 @@ if __name__ == "__main__":
     output_filename = os.path.join(args.o, base_filename + ".tsv.gz")
 
     data_list = []
-
     from_base = args.labeling_base
     to_base = args.sub_base
-
     max_transcript_length = df["region_end_coord"].max()
 
     low, high = map(int, args.initi_rate.split(","))
@@ -214,52 +160,39 @@ if __name__ == "__main__":
         pass 
 
     mean_elong_rate = df_nt['rate_for_this_nt'].mean()
-    
-    # Calculate Molecules per Cell (Per Simulation Unit)
     n_pol_per_unit = (max_transcript_length / mean_elong_rate + total_pausing_times) / (initiation_interval_sec / 60)
     
     bolus_per_unit = 0
     if args.drb:
-        n_pol_per_unit = 0 # Clear pre-existing elongating polymerases
-        bolus_per_unit = 1 # One paused polymerase at the TSS ready to fire
+        n_pol_per_unit = 0 
+        bolus_per_unit = 1 
 
-    # Determine how many "cells" (scaling_factor) we actually need to hit target size
-    
-    # Use args.mRNAcount instead of hardcoded 5000
     target_sample_size = int(args.mRNAcount * args.experiment_time / 10)
-    
-    # Add safety buffer (20%) and account for background loss
     needed_molecules = int(target_sample_size * 1.2)
     if args.bkg_molecules == 1:
         needed_molecules = 0
     elif args.bkg_molecules > 0:
         needed_molecules = int(needed_molecules / (1 - args.bkg_molecules))
     
-    # Calculate total molecules generated per single simulation unit (scaling_factor=1)
     initiations_per_unit = args.experiment_time / (initiation_interval_sec / 60)
     total_molecules_per_unit = n_pol_per_unit + bolus_per_unit + initiations_per_unit
 
-    # Calculate minimal scaling factor needed
     if total_molecules_per_unit > 0:
         scaling_factor = math.ceil(needed_molecules / total_molecules_per_unit)
     else:
-        scaling_factor = 1 # Prevent div by zero if something is weird
+        scaling_factor = 1 
 
     print(f"Optimizing run: Target={target_sample_size}, Scaler set to {scaling_factor} (was 50)")
     
     already_initiated = int(n_pol_per_unit * scaling_factor)
     n_mol_to_initiate = scaling_factor * args.experiment_time / (initiation_interval_sec / 60)
-    # --- OPTIMIZATION END ---
 
     single_nt_mask = df['region_start_coord'] == df['region_end_coord']
     inverse_weights = df['time_to_traverse']
     total_inverse_weight = inverse_weights.sum()
     expected_counts = (inverse_weights * already_initiated / total_inverse_weight).round().astype(int)
     
-    # We clip to scaling_factor (max 1 per cell at a specific bottleneck)
     single_nt_sample_counts = expected_counts[single_nt_mask].clip(upper=int(scaling_factor))
-    
-    # Faster dataframe expansion
     single_nt_samples = df.loc[single_nt_sample_counts.index].loc[single_nt_sample_counts.index.repeat(single_nt_sample_counts)]
 
     n_single_nt = single_nt_sample_counts.sum()
@@ -296,12 +229,8 @@ if __name__ == "__main__":
 
     if num_cells_needed > 0:
         for _ in range(int(num_cells_needed)):
-            
-            # 1. SYNCHRONIZED WAVE: 1 paused polymerase released per cell exactly at t=0
             if args.drb:
                 all_new_initiations.append(experiment_time_sec)
-            
-            # 2. NORMAL STOCHASTIC INITIATION: Resumes behind the wave (or runs continuously for steady-state)
             if n_mol_to_initiate > 0:
                 current_time = 0.0
                 while current_time < experiment_time_sec:
@@ -321,14 +250,13 @@ if __name__ == "__main__":
     for i in range(total_molecules):
         initiation = initiation_times[i] / 60 
         start_label_pos = int(start_label_pos_list[i])
-        
         stop_label_pos = findStopnt_optimized(times_raw, cumsum_times_padded, initiation, start_label_pos, rng)
         
-        # --- FIXED FUNCTION CALL ---
-        final_seq, pct_sub, conv_pos, inc_pos, pct_err, err_pos = generate_mutated_read(
+        # Call the new refactored function
+        pct_sub, conv_pos, inc_pos, pct_err, err_pos = generate_mutated_read(
             dna_sequence_arr,
-            int(stop_label_pos),  # read_stop_idx (The end of the RNA)
-            int(start_label_pos), # label_start_idx (Where labeling starts)
+            int(stop_label_pos),
+            int(start_label_pos),
             nt_incorporation_rate,
             sub_rate_percent_range,
             seqerr_range,
@@ -350,9 +278,8 @@ if __name__ == "__main__":
             conv_pos,
             inc_pos,
             pct_err,
-            err_pos,
-            final_seq
-        ]
+            err_pos
+        ] # full_molecule_sequence has been DROPPED
         data_list.append(row_data)
 
     # --- Background Molecules ---
@@ -367,42 +294,29 @@ if __name__ == "__main__":
         kept_indices = indices[:num_to_sample]
         data_list = [data_list[i] for i in kept_indices]
         
-        #bkg_molecules_to_simulate = round(len(data_list) * bkg_molecules / (1 - bkg_molecules))
         bkg_molecules_to_simulate = 100
 
+        # Retrieve lengths quickly without materializing background string loops
         idx = output_filename.find('pre-mRNA')
         up_to = output_filename[:idx]
         gtf_path_in = os.path.join(up_to, 'gtf', base_filename + '.tsv.gz')
 
         gtf_gene = pd.read_csv(gtf_path_in, sep='\t', comment='#')
-        gtf_gene.columns = ['chr', 'start', 'end', 'gene_id', 'feature', 'position', 'strand', 'sequence']
-
         if args.nosplicing:
-            full_sequence = ''.join(gtf_gene['sequence'].astype(str))
+            bg_len = gtf_gene['sequence'].str.len().sum()
         else:
-            exon_gtf = gtf_gene[gtf_gene['feature'] == 'exon'].copy()
-            full_sequence = ''.join(exon_gtf['sequence'].astype(str))
+            exon_gtf = gtf_gene[gtf_gene['feature'] == 'exon']
+            bg_len = exon_gtf['sequence'].str.len().sum()
         
-        bg_seq_arr = np.array(list(full_sequence), dtype='U1')
-        bg_len = len(bg_seq_arr)
         bg_ids = generate_ids_bulk(bkg_molecules_to_simulate, size=12, rng=rng)
         
         for i in range(bkg_molecules_to_simulate):
-            curr_bg = bg_seq_arr.copy()
-            
             seq_err_rate = rng.uniform(seqerr_range[0], seqerr_range[1])
             n_err = rng.binomial(bg_len, seq_err_rate)
             err_pos = []
             if n_err > 0:
                 err_locs = rng.choice(bg_len, size=n_err, replace=False)
                 err_pos = [int(x) for x in err_locs]
-                bases = np.array(['A', 'C', 'G', 'T'])
-                for loc in err_locs:
-                    orig = curr_bg[loc]
-                    poss = bases[bases != orig]
-                    curr_bg[loc] = rng.choice(poss)
-            
-            bg_read = "".join(curr_bg)
             
             bkg_row_data = [
                 0,
@@ -414,33 +328,30 @@ if __name__ == "__main__":
                 'NA',
                 'NA',
                 seq_err_rate,
-                err_pos,
-                bg_read
-            ]
+                err_pos
+            ] # full_molecule_sequence has been DROPPED
             bg_data_list.append(bkg_row_data)
 
-        bg_data_list_for_export = pd.DataFrame(bg_data_list, columns=["initiation_time", 'molecule_id', 'strand', "sub_rate_percent_range", 'start_label_pos',
-                                                                      'stop_label_pos', 'converted_positions', 'incorporated_positions', 'percentage_seq_err',
-                                                                      'seq_err_positions', 'full_molecule_sequence'])
+        # Updated export columns
+        bg_data_list_for_export = pd.DataFrame(bg_data_list, columns=[
+            "initiation_time", 'molecule_id', 'strand', "sub_rate_percent_range", 
+            'start_label_pos', 'stop_label_pos', 'converted_positions', 
+            'incorporated_positions', 'percentage_seq_err', 'seq_err_positions'
+        ])
         bg_data_list_for_export.to_csv(output_filename_bg, sep='\t', index=False, compression='gzip')
 
-    df_for_export = pd.DataFrame(data_list, columns=["initiation_time", 'molecule_id', 'strand', "sub_rate_percent_range", 'start_label_pos',
-                                                    'stop_label_pos', 'converted_positions', 'incorporated_positions', 'percentage_seq_err',
-                                                    'seq_err_positions', 'full_molecule_sequence'])
+    df_for_export = pd.DataFrame(data_list, columns=[
+        "initiation_time", 'molecule_id', 'strand', "sub_rate_percent_range", 
+        'start_label_pos', 'stop_label_pos', 'converted_positions', 
+        'incorporated_positions', 'percentage_seq_err', 'seq_err_positions'
+    ])
 
-    # Optimization: Use the variable calculated at the start
     if len(df_for_export) > target_sample_size:
         df_for_export = df_for_export.sample(n=target_sample_size, random_state=42)
 
     df_for_export.to_csv(output_filename, sep='\t', index=False, compression='gzip')
 
     summary_path = os.path.join(args.o, "initiation_rates_all.tsv")
-    df_summary = pd.DataFrame(
-        [{"gene_id": base_filename, "initiation_rate": initiation_interval_sec}]
-    )
+    df_summary = pd.DataFrame([{"gene_id": base_filename, "initiation_rate": initiation_interval_sec}])
     file_exists = os.path.exists(summary_path)
-    df_summary.to_csv(summary_path,
-                      sep="\t",
-                      index=False,
-                      mode="a",
-                      header=not file_exists)
+    df_summary.to_csv(summary_path, sep="\t", index=False, mode="a", header=not file_exists)
