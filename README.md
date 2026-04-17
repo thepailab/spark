@@ -134,6 +134,10 @@ sequencing strategy:
   --s {rf,fr,unstranded}
                         library strandedness (default: rf)
   --fragments           export a ground truth for fragmentation & size selection (default: False)
+  --sizeselectiontype {none,hardcut,probabilistic}
+                        type of size selection. 'hardcut' strictly filters fragments outside the --insert_size limits, while 'probabilistic' applies a double-sided sigmoid retention curve
+                        around those limits (only valid for nascentrnapd and ttseq) (default: probabilistic)
+  --no_fragmentation    if specified, do not fragment (only valid for nascentrnapd and ttseq) (default: False)
 ```
 
 **Snippet to simulate 100nt fr-firststrand paired-end reads from 1000 genes from a TTseq library:**
@@ -163,7 +167,7 @@ spark.py --mode seq_tech -o ./out_dir/ --experiment_type mnetseq --s rf --seq_ty
 
 ### Step 1: Gene Selection
 
-**Clustering by gene features (```--mode tsvgeneration```)**
+**Clustering by gene features (```--mode mRNAgeneration```)**
 
 SPARK is designed to select genes from which to simulate nascent RNA reads that represent a diversity of genomic features. Users specify the number of genes from which they would like to simulate reads and provide: (1) a gtf with gene annotations and (2) a reference fasta file. For each gene, the longest isoform (upstream-most transcript start site and downstream-most transcript end site) is selected, and its features are used for classification. Genes in the gtf are first categorized by gene length, total transcript length(s), number of exons, mean exon lengths, number of introns, mean intron lengths, first intron length, lengths of 5′ and 3′ untranslated regions (UTRs), and exonic and intronic nucleotide composition. Hierarchical clustering is used to identify clusters of transcripts with similar characteristics. 
 
