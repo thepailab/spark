@@ -317,13 +317,20 @@ def main():
     elif args.mode == "proseq":
         if "molecule_id" not in df.columns:
             raise ValueError("'molecule_id' column required for proseq mode")
-        tid_to_molid = dict(zip(df["transcript_id"].astype(int), df["molecule_id"]))
 
+        # PRO-seq captures the 3' end of the nascent RNA (where Pol II stalled).
+        # Each fragment must be anchored at sequence_length, not randomly placed.
+        seq_lengths = df["sequence_length"].values.astype(int)
+        fragment_sizes = rng.integers(ins_min, ins_max + 1, size=len(df))
+        read_ends = seq_lengths
+        read_starts = np.maximum(1, seq_lengths - fragment_sizes)
+
+        keep = (read_ends - read_starts) > 10
         frag_df = pd.DataFrame({
-            "transcript_id": tids.astype(int),
-            "molecule_id":   [tid_to_molid.get(int(t), "") for t in tids],
-            "read_start":    sel_starts.astype(int),
-            "read_end":      sel_ends.astype(int),
+            "transcript_id": df["transcript_id"].values[keep].astype(int),
+            "molecule_id":   df["molecule_id"].values[keep],
+            "read_start":    read_starts[keep].astype(int),
+            "read_end":      read_ends[keep].astype(int),
         })
         frag_df.to_csv(out_path, sep="\t", index=False)
 
@@ -346,4 +353,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
