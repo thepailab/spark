@@ -90,7 +90,7 @@ spark.py --show_presets
 | `proseq` | Precision Nuclear Run-on (PRO)-seq | proseq | T | — | — | 0.02 |
 | `mNETseq` | mammalian Native Elongating Transcript (mNET)-seq | mnetseq | — | — | — | 0.10 |
 | `chromatinassociated` | Chromatin-associated RNA-seq | chromatin_associated | — | — | — | 0.20 |
-| `polyA` | Steady-state polyA | — | — | none | 0.005,0.023 | — |
+| `polyA` | Steady-state polyA | — | — | none | — | — |
 
 Presets can also be customized by additional flags on top of it. For example, to run the mNETseq preset but with deeper sequencing library:
 ```
