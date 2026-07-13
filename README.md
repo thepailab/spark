@@ -208,7 +208,7 @@ sequencing strategy:
                         total library sequencing depth (default: 20000000)
   --insert_size INSERT_SIZE
                         length of insert (default: 200,300)
-  --tpm TPM             range of TPMs genes can have (default: 5,200)
+  --rpkm RPKM             range of RPKMs genes can have (default: 5,200)
   --read_length READ_LENGTH
                         length of each read (default: 100)
   --s {rf,fr,unstranded}
