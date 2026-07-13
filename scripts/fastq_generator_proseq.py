@@ -159,9 +159,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    filename = os.path.basename(args.input_df)
+    base_filename = filename.replace("_proseq.tsv.gz", "")
+
+    # Seed per-gene: mix the gene identity into the seed so each gene draws a
+    # distinct TPM. Without this, every gene process re-seeds with the same raw
+    # --seed and np.random.uniform() returns an identical TPM for all genes.
+    # Mirrors fastq_generator_short_read.py and mRNA_generator.py.
     if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
+        hasher = hashlib.sha256(base_filename.encode('utf-8'))
+        gene_hash = int(hasher.hexdigest(), 16)
+        unique_seed = (args.seed + gene_hash) % 4294967295
+        random.seed(unique_seed)
+        np.random.seed(unique_seed)
 
     cmd_chop = [
         f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
@@ -179,8 +189,6 @@ if __name__ == "__main__":
         cmd_chop += ['--seed', str(args.seed)]
     run_cmd(" ".join(cmd_chop))
 
-    filename = os.path.basename(args.input_df)
-    base_filename = filename.replace("_proseq.tsv.gz", "")
     output_prefix = f"{args.o}/reads/{base_filename}"
     chopped_coordinates_file_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_fragments.tsv"
 

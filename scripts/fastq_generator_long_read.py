@@ -178,7 +178,7 @@ if __name__ == "__main__":
                     sampled_df = pd.concat([df, additional_samples], ignore_index=True)
                 
                 for row in sampled_df.itertuples():
-                    molecule_id = id_generator()
+                    molecule_id = str(getattr(row, 'molecule_id', id_generator()))
                     read_name = f"{molecule_id}_{base_filename}"
                     
                     raw_seq = reconstruct_main(
@@ -216,7 +216,7 @@ if __name__ == "__main__":
                             sampled_bg = pd.concat([df_bg, additional_samples], ignore_index=True)
 
                         for row in sampled_bg.itertuples():
-                            molecule_id = id_generator()
+                            molecule_id = str(getattr(row, 'molecule_id', id_generator()))
                             read_name = f"{molecule_id}_{base_filename}_BG"
                             
                             raw_seq = reconstruct_bg(bg_arr, getattr(row, 'seq_err_positions', '[]'), getattr(row, 'polyA_length', 0))
