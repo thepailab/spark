@@ -4,12 +4,12 @@ this was written to be able to chop acorss seq methods, such that:
 
 tree output modes (--mode) hardcoded into the fastq generators that call thiss cript:
   normal  – used by fastq_generator_short_read.py
-            Collapsed output (transcript_id → "start-end,start-end,..."), writes TPM,
+            Collapsed output (transcript_id → "start-end,start-end,..."), writes RPKM,
             optionally writes coverage ground-truth files.
   proseq  – used by fastq_generator_proseq.py
             Per-row output (transcript_id, molecule_id, read_start, read_end).
   ttseq   – used by mRNA_to_reads_ttseq.py
-            Collapsed output, no TPM, drops fragments shorter than 10 nt.
+            Collapsed output, no RPKM, drops fragments shorter than 10 nt.
 
 """
 
@@ -140,9 +140,9 @@ def main():
     parser.add_argument("--threads",         type=int, default=1,
                         help="Threads (kept for CLI compatibility)")
     parser.add_argument("--seq_depth",       type=int, default=20_000_000,
-                        help="Total library sequencing depth (used for TPM in normal mode)")
-    parser.add_argument("--tpm_lower_limit", type=int, default=5)
-    parser.add_argument("--tpm_upper_limit", type=int, default=200)
+                        help="Total library sequencing depth (used for RPKM in normal mode)")
+    parser.add_argument("--rpkm_lower_limit", type=int, default=5)
+    parser.add_argument("--rpkm_upper_limit", type=int, default=200)
     parser.add_argument("-o", "--dir_out",   default=".",
                         help="Output directory (same -o as fastq generators)")
     parser.add_argument("--seed",            type=int, default=None)
@@ -183,11 +183,11 @@ def main():
 
     try:
         df = pd.read_csv(args.tsv, sep='\t')
-        
+
         if df.empty:
             print(f"Warning: {args.tsv} contains no molecules (likely 100% background). Exiting gracefully.")
             sys.exit(0)
-            
+
         if 'sequence_length' not in df.columns:
             raise ValueError(f"'sequence_length' column not found in {args.tsv}")
 
@@ -198,11 +198,11 @@ def main():
 
     if "full_molecule_sequence" in df.columns:
         df = df.drop(columns=["full_molecule_sequence"])
-        
+
     df["transcript_id"] = range(1, len(df) + 1)
-    
+
     if len(df) <= 5:
-        return  
+        return
 
 
     sel_starts_list = []
@@ -213,6 +213,8 @@ def main():
 
     need_pre_cov = (args.mode == "normal" and args.fragments == "with_ground_truth")
 
+    has_span = (args.mode == "normal") and ("start_label_pos" in df.columns) and ("stop_label_pos" in df.columns)
+
     for row in df.itertuples(index=False):
         seq_len = int(row.sequence_length)
         tid     = int(row.transcript_id)
@@ -222,6 +224,15 @@ def main():
             no_fragmentation=args.no_fragmentation,
             sizeselectiontype=args.sizeselectiontype,
         )
+
+        if has_span:
+            valid_start = seq_len - (int(row.stop_label_pos) - int(row.start_label_pos))
+            if valid_start > 0:
+                keep_valid = s_sel >= valid_start
+                s_sel, e_sel = s_sel[keep_valid], e_sel[keep_valid]
+                if need_pre_cov:
+                    keep_valid_all = s_all >= valid_start
+                    s_all, e_all = s_all[keep_valid_all], e_all[keep_valid_all]
 
         if len(s_sel) > 0:
             sel_starts_list.append(s_sel)
@@ -258,14 +269,14 @@ def main():
 
     if args.mode == "normal":
         gene_length_kb = float(df["sequence_length"].mean()) / 1000.0
-        gene_tpm       = float(rng.uniform(args.tpm_lower_limit, args.tpm_upper_limit))
+        gene_rpkm       = float(rng.uniform(args.rpkm_lower_limit, args.rpkm_upper_limit))
         seq_depth_m    = args.seq_depth / 1e6
-        reads_to_get   = gene_length_kb * gene_tpm * seq_depth_m
+        reads_to_get   = gene_length_kb * gene_rpkm * seq_depth_m
 
-        #TPM temp file (may be overwritten by fastq_generator_short_read.py – that's ok)
-        tpm_path = os.path.join(temp_dir, f"temp_{out_gene_id}_tpm.tsv")
-        pd.DataFrame([{"gene_id": out_gene_id, "tpm": gene_tpm}]).to_csv(
-            tpm_path, sep="\t", index=False
+        #RPKM temp file (may be overwritten by fastq_generator_short_read.py – that's ok)
+        rpkm_path = os.path.join(temp_dir, f"temp_{out_gene_id}_rpkm.tsv")
+        pd.DataFrame([{"gene_id": out_gene_id, "rpkm": gene_rpkm}]).to_csv(
+            rpkm_path, sep="\t", index=False
         )
 
         #ground truth if specified
@@ -298,7 +309,7 @@ def main():
                         sep="\t", index=False
                     )
 
-        
+
         frag_df = pd.DataFrame({
             "transcript_id": tids.astype(int),
             "read_start":    sel_starts.astype(int),

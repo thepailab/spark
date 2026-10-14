@@ -8,7 +8,8 @@ import hashlib
 
 def chop_sequence_bg_coords(seq_len):
     """
-    deternube coordinates for a random fragment (35-100nt) from a background sequence.
+    Determines coordinates for a random fragment (35-100nt) from a background sequence.
+    Returns: (start_pos, end_pos)
     """
     fragment_length = random.randint(35, 100)
     
@@ -22,7 +23,7 @@ def chop_sequence_bg_coords(seq_len):
     return start_pos, end_pos
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="convert mRNAs to mNET-seq fragments")
+    parser = argparse.ArgumentParser(description="convert mRNAs to NET-seq fragments")
     parser.add_argument("--input_df", help="full path to the mRNA dataframe")
     parser.add_argument("--o", type=str, default="./", help="output path")
     parser.add_argument("--seed", type=int, help="random seed for reproducibility")
@@ -34,7 +35,7 @@ if __name__ == "__main__":
     
     filename = os.path.splitext(os.path.basename(args.input_df))[0]
     base_filename = filename.split(".")[0]
-    output_filename = os.path.join(args.o, base_filename + "_mnetseq.tsv.gz")
+    output_filename = os.path.join(args.o, base_filename + "_netseq.tsv.gz")
 
     if args.seed is not None:
         hasher = hashlib.sha256(base_filename.encode('utf-8'))
@@ -64,7 +65,7 @@ if __name__ == "__main__":
     with gzip.open(output_filename, 'wt') as f_out:
         f_out.write("\t".join(output_columns) + "\n")
 
-        print(f"[mNET-seq] Processing main gene coordinates: {base_filename}")
+        print(f"[NET-seq] Processing main gene coordinates: {base_filename}")
         
         df = pd.read_csv(args.input_df, sep="\t", comment="#")
         
@@ -75,7 +76,7 @@ if __name__ == "__main__":
         df["fragment_start_pos"] = (df["stop_label_pos"] - random_offsets).clip(lower=0)
         df["fragment_end_pos"] = df["stop_label_pos"]
         
-        #size filter to avoid short inserts
+        # size filter to avoid short inserts
         df["frag_len"] = df["fragment_end_pos"] - df["fragment_start_pos"]
         df_valid = df[df["frag_len"] > 10]
         
@@ -94,14 +95,14 @@ if __name__ == "__main__":
         del df
         del df_valid
 
-        #bkg molecules
+        # bkg molecules
 
         if args.bkg_molecules > 0.0:
             path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
             
             if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
                 
-                #calculate required background count
+                # calculate required background count
                 if gene_fragment_count > 0 and args.bkg_molecules < 1.0:
                     ratio = args.bkg_molecules / (1.0 - args.bkg_molecules)
                     reads_to_get_bg = int(gene_fragment_count * ratio)
@@ -111,7 +112,7 @@ if __name__ == "__main__":
                     reads_to_get_bg = 0
 
                 if reads_to_get_bg > 0:
-                    print(f"[mNET-seq] Adding {reads_to_get_bg} background coordinate footprints...")
+                    print(f"[NET-seq] Adding {reads_to_get_bg} background coordinate footprints...")
                     
                     df_bg = pd.read_csv(path_to_BGmRNAs, sep="\t", comment="#")
                     
@@ -124,7 +125,7 @@ if __name__ == "__main__":
                     for row in bg_sample.itertuples():
                         mol_id = str(row.molecule_id) + '_BG_'
                         
-                        
+                        # Use the sequence_length column to determine bounds mathematically
                         seq_len = getattr(row, 'sequence_length', 1000) 
                         fstart, fend = chop_sequence_bg_coords(seq_len)
                         

@@ -3,11 +3,13 @@ import gzip
 import random
 import argparse
 import os
+import sys
 import subprocess
 import string
 import ast
 import numpy as np
 import hashlib
+from spark_labeling import parse_conversion_map
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -77,8 +79,9 @@ def get_valid_ttseq_fragments(df_frags, lookup_dict, read_length):
 
 def process_and_write_fastq(
     df_sampled, lookup_dict, output_prefix, sequencing_type, 
-    strandedness, read_length, rates_df, ref_arr, bg_ref_arr, sub_base='C'
+    strandedness, read_length, rates_df, ref_arr, bg_ref_arr, conv_map=None
 ):
+    conv_map = conv_map or {}
     if sequencing_type == "SE":
         f_out = gzip.open(f"{output_prefix}.fastq.gz", 'wt')
     else:
@@ -97,7 +100,9 @@ def process_and_write_fastq(
             if not is_bg:
                 conv_pos = [p for p in ref_data['conv'] if p < len(mol_arr)]
                 err_pos = [p for p in ref_data.get('err', []) if p < len(mol_arr)]
-                if sub_base: mol_arr[conv_pos] = sub_base
+                if conv_map and conv_pos:
+                    orig_bases = mol_arr[conv_pos]
+                    mol_arr[conv_pos] = [conv_map.get(b, b) for b in orig_bases]
                 
                 for p in err_pos:
                     mol_arr[p] = random.choice([b for b in ['A','C','G','T'] if b != mol_arr[p]])
@@ -203,17 +208,20 @@ if __name__ == "__main__":
     parser.add_argument("--s", choices=["rf", "fr","unstranded"], type=str, default='rf')
     parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--tpm_lower_limit', type=int, default=5)
-    parser.add_argument('--tpm_upper_limit', type=int, default=200)
+    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
+    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument("--fragments", action="store_true")
     parser.add_argument('--bkg_molecules', type=float, default=0)
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
     parser.add_argument("--sizeselectiontype", choices=["none", "hardcut", "probabilistic"], default="probabilistic")
     parser.add_argument("--no_fragmentation", action="store_true")
+    parser.add_argument("--labeling_base", type=str, default='T')
     parser.add_argument("--sub_base", type=str, default='C')
 
     args = parser.parse_args()
+
+    _from_bases, conv_map = parse_conversion_map(args.labeling_base, args.sub_base)
 
     filename = os.path.basename(args.input_df)
     base_filename = filename.replace(".tsv.gz", "")
@@ -310,18 +318,25 @@ if __name__ == "__main__":
 
     del df_ref_raw 
 
-    try: 
-        df = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
-        df['read_coordinates'] = df['read_coordinates'].astype(str).str.split(',')
-        df_exploded = df.explode('read_coordinates').reset_index(drop=True)
-        df_exploded.rename(columns={'read_coordinates': 'read_coordinate_split'}, inplace=True)
-        
-        coord_split = df_exploded['read_coordinate_split'].str.split('-', expand=True)
-        df_exploded['read_start'] = pd.to_numeric(coord_split[0], errors='coerce')
-        df_exploded['read_end'] = pd.to_numeric(coord_split[1], errors='coerce')
-        df_exploded = df_exploded.dropna(subset=['read_start', 'read_end'])
-        
-        result_df = get_valid_ttseq_fragments(df_exploded, clean_ref_dict, args.read_length)
+    try:
+        # The main (nascent) fragments file is absent when the nascent mRNA df is
+        # empty (e.g. bkg_molecules == 1, where every molecule is background). In
+        # that case start from an empty read pool and let the background block below
+        # supply all the reads, instead of aborting the whole gene.
+        if os.path.exists(chopped_coordinates_file_path) and os.path.getsize(chopped_coordinates_file_path) > 0:
+            df = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
+            df['read_coordinates'] = df['read_coordinates'].astype(str).str.split(',')
+            df_exploded = df.explode('read_coordinates').reset_index(drop=True)
+            df_exploded.rename(columns={'read_coordinates': 'read_coordinate_split'}, inplace=True)
+
+            coord_split = df_exploded['read_coordinate_split'].str.split('-', expand=True)
+            df_exploded['read_start'] = pd.to_numeric(coord_split[0], errors='coerce')
+            df_exploded['read_end'] = pd.to_numeric(coord_split[1], errors='coerce')
+            df_exploded = df_exploded.dropna(subset=['read_start', 'read_end'])
+
+            result_df = get_valid_ttseq_fragments(df_exploded, clean_ref_dict, args.read_length)
+        else:
+            result_df = pd.DataFrame()
 
         if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
             cmd_chop_bg = [
@@ -392,6 +407,12 @@ if __name__ == "__main__":
             result_df = result_df.sample(n=n_main, random_state=42) 
             result_df = pd.concat([result_df, result_df_bg]).reset_index(drop=True)
 
+        # Nothing to emit for this gene (no nascent and no background reads) -> skip.
+        # This block runs at module level (not inside a function), and each gene is
+        # its own subprocess, so exit cleanly rather than `return`.
+        if result_df.empty or 'read_end' not in result_df.columns:
+            sys.exit(0)
+
         result_df["insert_size"] = result_df["read_end"] - result_df["read_start"]
         insert_values = args.insert_size.split(",")
         min_insert = int(insert_values[0])
@@ -402,19 +423,19 @@ if __name__ == "__main__":
         if args.sizeselectiontype == 'hardcut':
             result_df = result_df[(result_df['insert_size'] >= min_insert) & (result_df['insert_size'] <= max_insert)]
 
-        gene_tpm = np.random.uniform(low=int(args.tpm_lower_limit), high=int(args.tpm_upper_limit))
+        gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
         
         
-        temp_dir_tpm = os.path.join(args.o, "temp")
-        os.makedirs(temp_dir_tpm, exist_ok=True)
-        tpm_path = os.path.join(temp_dir_tpm, f"temp_{base_filename}_tpm.tsv")
+        temp_dir_rpkm = os.path.join(args.o, "temp")
+        os.makedirs(temp_dir_rpkm, exist_ok=True)
+        rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
         
-        df_tpm = pd.DataFrame([{"gene_id": base_filename, "tpm": gene_tpm}])
-        df_tpm.to_csv(tpm_path, sep="\t", index=False)
+        df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
+        df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
         
 
         seq_depth = args.seq_depth / 1e6
-        reads_to_get = gene_length * gene_tpm * seq_depth
+        reads_to_get = gene_length * gene_rpkm * seq_depth
 
         if args.fragments:
             if not result_df_pre_selection.empty:
@@ -472,7 +493,7 @@ if __name__ == "__main__":
 
             process_and_write_fastq(
                 result_df, clean_ref_dict, output_prefix, args.seq_type, args.s,
-                args.read_length, rates_df, ref_arr, bg_ref_arr, sub_base=args.sub_base
+                args.read_length, rates_df, ref_arr, bg_ref_arr, conv_map=conv_map
             )
 
         try:
@@ -485,4 +506,5 @@ if __name__ == "__main__":
 
     except FileNotFoundError:
         pass
+
 

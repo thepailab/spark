@@ -149,15 +149,15 @@ if __name__ == "__main__":
     parser.add_argument("--s", choices=["rf", "fr", "unstranded"], type=str, default='rf')
     parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--tpm_lower_limit', type=int, default=5)
-    parser.add_argument('--tpm_upper_limit', type=int, default=200)
+    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
+    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
 
     args = parser.parse_args()
 
     filename = os.path.basename(args.input_df)
-    base_filename = filename.replace("_mnetseq.tsv.gz", "")
+    base_filename = filename.replace("_netseq.tsv.gz", "")
 
     if args.seed is not None:
         hasher = hashlib.sha256(base_filename.encode('utf-8'))
@@ -167,7 +167,7 @@ if __name__ == "__main__":
         np.random.seed(unique_seed)
 
     output_prefix = f"{args.o}/reads/{base_filename}"
-    chopped_coordinates_file_path = f"{args.o}/mnetseqmRNAs/{base_filename}_mnetseq.tsv.gz"
+    chopped_coordinates_file_path = f"{args.o}/netseqmRNAs/{base_filename}_netseq.tsv.gz"
 
     gtf_path = f"{args.o}/gtf/{base_filename}.tsv.gz"
     if os.path.exists(gtf_path):
@@ -178,7 +178,7 @@ if __name__ == "__main__":
         ref_arr = np.array(list(ref_seq_full), dtype='U1')
         
         is_bg_spliced = True
-        path_to_BGmRNAs = os.path.join(os.path.dirname(args.o.rstrip('/')), "mRNA", base_filename + "_background.tsv.gz")
+        path_to_BGmRNAs = os.path.join(args.o.rstrip('/'), "mRNA", base_filename + "_background.tsv.gz")
         
         if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
             try:
@@ -202,17 +202,17 @@ if __name__ == "__main__":
     try:
         df = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
         
-        gene_tpm = np.random.uniform(low=int(args.tpm_lower_limit), high=int(args.tpm_upper_limit))
+        gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
         
-        temp_dir_tpm = os.path.join(args.o, "temp")
-        os.makedirs(temp_dir_tpm, exist_ok=True)
-        tpm_path = os.path.join(temp_dir_tpm, f"temp_{base_filename}_tpm.tsv")
+        temp_dir_rpkm = os.path.join(args.o, "temp")
+        os.makedirs(temp_dir_rpkm, exist_ok=True)
+        rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
         
-        df_tpm = pd.DataFrame([{"gene_id": base_filename, "tpm": gene_tpm}])
-        df_tpm.to_csv(tpm_path, sep="\t", index=False)
+        df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
+        df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
 
         seq_depth = args.seq_depth / 1e6
-        reads_to_get = gene_tpm * seq_depth
+        reads_to_get = gene_length * gene_rpkm * seq_depth
 
         if len(df) >= reads_to_get:
             df = df.sample(n=int(reads_to_get), replace=False, random_state=None)
