@@ -151,8 +151,8 @@ if __name__ == "__main__":
     parser.add_argument("--s", choices=["rf", "fr", "unstranded"], type=str, default='rf')
     parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--tpm_lower_limit', type=int, default=5)
-    parser.add_argument('--tpm_upper_limit', type=int, default=200)
+    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
+    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument('--bkg_molecules', type=float, default=0)
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
@@ -162,10 +162,6 @@ if __name__ == "__main__":
     filename = os.path.basename(args.input_df)
     base_filename = filename.replace("_proseq.tsv.gz", "")
 
-    # Seed per-gene: mix the gene identity into the seed so each gene draws a
-    # distinct TPM. Without this, every gene process re-seeds with the same raw
-    # --seed and np.random.uniform() returns an identical TPM for all genes.
-    # Mirrors fastq_generator_short_read.py and mRNA_generator.py.
     if args.seed is not None:
         hasher = hashlib.sha256(base_filename.encode('utf-8'))
         gene_hash = int(hasher.hexdigest(), 16)
@@ -181,8 +177,8 @@ if __name__ == "__main__":
         f"--read_length {args.read_length}",
         f"--threads {args.threads}",
         f"--seq_depth {args.seq_depth}",
-        f"--tpm_lower_limit {args.tpm_lower_limit}",
-        f"--tpm_upper_limit {args.tpm_upper_limit}",
+        f"--rpkm_lower_limit {args.rpkm_lower_limit}",
+        f"--rpkm_upper_limit {args.rpkm_upper_limit}",
         f"-o {args.o}"
     ]
     if args.seed:
@@ -267,19 +263,19 @@ if __name__ == "__main__":
             except FileNotFoundError:
                 pass
 
-        gene_tpm = np.random.uniform(low=int(args.tpm_lower_limit), high=int(args.tpm_upper_limit))
+        gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
         
         
-        temp_dir_tpm = os.path.join(args.o, "temp")
-        os.makedirs(temp_dir_tpm, exist_ok=True)
-        tpm_path = os.path.join(temp_dir_tpm, f"temp_{base_filename}_tpm.tsv")
+        temp_dir_rpkm = os.path.join(args.o, "temp")
+        os.makedirs(temp_dir_rpkm, exist_ok=True)
+        rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
         
-        df_tpm = pd.DataFrame([{"gene_id": base_filename, "tpm": gene_tpm}])
-        df_tpm.to_csv(tpm_path, sep="\t", index=False)
+        df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
+        df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
         
         
         seq_depth = args.seq_depth / 1e6
-        reads_to_get = int(gene_tpm * seq_depth)
+        reads_to_get = int(gene_length * gene_rpkm * seq_depth)
 
         if len(result_df) >= reads_to_get:
             result_df = result_df.sample(n=reads_to_get, replace=False, random_state=None)
@@ -314,4 +310,5 @@ if __name__ == "__main__":
 
     except FileNotFoundError:
         pass
+
 

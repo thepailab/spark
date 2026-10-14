@@ -235,7 +235,19 @@ if (opt$protein_coding_only) {
 }
 #These are modular metrics instead of a unique function to make it more customizable
 #Get gene length
-gene_length_ref <- gencode_data[gencode_data$V3=='gene',] %>% dplyr::group_by(gene_id) %>% dplyr::reframe(gene_length=V5-V4)
+#gene_length_ref <- gencode_data[gencode_data$V3=='gene',] %>% dplyr::group_by(gene_id) %>% dplyr::reframe(gene_length=V5-V4)
+gene_rows <- gencode_data[gencode_data$V3 == 'gene', ]
+if (nrow(gene_rows) > 0) {
+  gene_length_ref <- gene_rows %>%
+    dplyr::group_by(gene_id) %>%
+    dplyr::reframe(gene_length = V5 - V4)
+} else {
+  gene_length_ref <- gencode_data %>%
+    dplyr::filter(!is.na(gene_id)) %>%
+    dplyr::group_by(gene_id) %>%
+    dplyr::reframe(gene_length = max(V5) - min(V4))
+}
+
 #Find the longest transcript for the gene
 longest_txpt <- getLongestTranscript(gencode_data)
 #Add longest transcript info to gene ids to generate the final df with metrics

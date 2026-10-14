@@ -6,6 +6,26 @@ import os
 from scipy.stats import linregress
 import hashlib
 
+
+def atomic_to_csv(df, path, **kwargs):
+    """Write a DataFrame to `path` atomically.
+
+    Writes to a unique temp file in the same directory, then os.replace()s it
+    into place. os.replace is atomic on the same filesystem, so a concurrent or
+    re-queued writer can never leave a half-written file (or a valid gzip stream
+    with trailing garbage appended) behind. If `path` ends in .gz, gzip is set
+    explicitly rather than relying on pandas' extension inference.
+    """
+    if path.endswith(".gz") and "compression" not in kwargs:
+        kwargs["compression"] = "gzip"
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        df.to_csv(tmp, **kwargs)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
 def calculate_time_sums_optimized(mRNA_df, intron_df, mRNA_rates, strand):
     mRNA_rates_sorted = mRNA_rates.sort_values('nucleotide_coord').reset_index(drop=True)
     coords = mRNA_rates_sorted['nucleotide_coord'].values
@@ -296,7 +316,7 @@ if __name__ == "__main__":
             else:
                 mRNA_df['sequence_length'] = mRNA_df['stop_label_pos']
                 mRNA_df['spliced_introns'] = "[]"
-        mRNA_df.to_csv(output_filename_spliced_mRNAs, sep='\t', index=False)
+        atomic_to_csv(mRNA_df, output_filename_spliced_mRNAs, sep='\t', index=False)
         exit(0)
 
     mRNA_gtf = pd.read_csv(path_to_gtf, sep="\t", comment="#")
@@ -310,7 +330,7 @@ if __name__ == "__main__":
     if intron_df.shape[0] == 0:
         mRNA_df['sequence_length'] = mRNA_df['stop_label_pos']
         mRNA_df['spliced_introns'] = "[]"
-        mRNA_df.to_csv(output_filename_spliced_mRNAs, sep='\t', index=False)
+        atomic_to_csv(mRNA_df, output_filename_spliced_mRNAs, sep='\t', index=False)
         exit(0)
 
     exon_row = mRNA_gtf[(mRNA_gtf['feature'] == 'exon') & (mRNA_gtf['position'] == 1)]
@@ -365,7 +385,7 @@ if __name__ == "__main__":
                 print(f"{intron_name}: Input={input_hl:.2f} min | Estimated={est_hl:.2f} min | R2={r2:.2f}")
 
         output_validation = os.path.join(args.o, 'intron_half_lives', base_filename + "_validation.tsv")
-        validation_df.to_csv(output_validation, sep='\t', index=False)
+        atomic_to_csv(validation_df, output_validation, sep='\t', index=False)
     else:
         print("No validation data available (possibly no introns or no data points).")
     
@@ -373,15 +393,15 @@ if __name__ == "__main__":
         print("Generating surviving feature coordinates...", flush=True)
         surviving_features_df = get_surviving_features(mRNA_df, spliced_df, mRNA_gtf, strand, TSS_coord)
         output_filename_coords = os.path.join(args.o, 'intron_half_lives', base_filename + "_mRNAfeature_coords.tsv.gz")
-        surviving_features_df.to_csv(output_filename_coords, sep='\t', index=False, compression='gzip')
+        atomic_to_csv(surviving_features_df, output_filename_coords, sep='\t', index=False)
     
    
     mRNA_df_spliced = record_splicing_events(mRNA_df, spliced_df, intron_df, strand)
-    mRNA_df_spliced.to_csv(output_filename_spliced_mRNAs, sep='\t', index=False)
+    atomic_to_csv(mRNA_df_spliced, output_filename_spliced_mRNAs, sep='\t', index=False)
 
     if mean_half_life_dict is None:
         half_life_df = pd.DataFrame(run_mean_half_life_dict.items(), columns=['intron', 'half_life'])
-        half_life_df.to_csv(output_filename_halflives, sep='\t', compression='gzip', index=False)
+        atomic_to_csv(half_life_df, output_filename_halflives, sep='\t', index=False)
 
         intron_df_out = mRNA_gtf[mRNA_gtf['feature'] == 'intron'].copy()
         
@@ -399,8 +419,4 @@ if __name__ == "__main__":
             cols_to_drop.append('sequence')
             
         intron_df_to_save = intron_df_out.drop(columns=cols_to_drop)
-        intron_df_to_save.to_csv(output_intron_abscoords, sep='\t', compression='gzip', index=False)
-
-
-
-
+        atomic_to_csv(intron_df_to_save, output_intron_abscoords, sep='\t', index=False)

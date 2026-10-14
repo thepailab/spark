@@ -4,8 +4,29 @@ import math
 import os
 import string
 import numpy as np
-import hashlib  
+import hashlib
 import pysam
+from spark_labeling import parse_conversion_map
+
+
+def atomic_to_csv(df, path, **kwargs):
+    """Write a DataFrame to `path` atomically.
+
+    Writes to a unique temp file in the same directory, then os.replace()s it
+    into place. os.replace is atomic on the same filesystem, so a concurrent or
+    re-queued writer can never leave a half-written file (or a valid gzip stream
+    with trailing garbage appended) behind. If `path` ends in .gz, gzip is set
+    explicitly rather than relying on pandas' extension inference.
+    """
+    if path.endswith(".gz") and "compression" not in kwargs:
+        kwargs["compression"] = "gzip"
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        df.to_csv(tmp, **kwargs)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 def getDNAseq_array(dna_sequence):
     return np.array(list(''.join(str(i) for i in dna_sequence)), dtype='U1')
@@ -30,9 +51,9 @@ def findStopnt_optimized(times_array, cumsum_times_padded, labeling_duration, st
     idx_in_slice = np.searchsorted(total_times, labeling_duration, side="right")
     return startsite + idx_in_slice
 
-def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx, 
-                          nt_inc_range, sub_rate_range, seq_err_range, 
-                          from_base, to_base, rng):
+def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx,
+                          nt_inc_range, sub_rate_range, seq_err_range,
+                          from_bases, to_base, rng):
     stop_safe = min(len(seq_array_ref), read_stop_idx)
     lbl_start_safe = max(0, label_start_idx)
     
@@ -42,7 +63,7 @@ def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx,
     
     if lbl_start_safe < stop_safe:
         label_view = seq_array_ref[lbl_start_safe:stop_safe]
-        from_indices = np.where(label_view == from_base)[0]
+        from_indices = np.where(np.isin(label_view, from_bases))[0]
         n_candidates = len(from_indices)
         
         nt_inc_rate_val = rng.uniform(nt_inc_range[0], nt_inc_range[1])
@@ -84,7 +105,7 @@ if __name__ == "__main__":
     parser.add_argument('--region_file', default='tmp.gtf')
     parser.add_argument('--nt_file', default='tmp.gtf')
     parser.add_argument('--experiment_time', type=int, default=15)
-    parser.add_argument('--experiment_type', choices=['metaboliclabeling', 'ttseq', 'mnetseq', 'proseq','chromatin_associated'], default='metaboliclabeling')
+    parser.add_argument('--experiment_type', choices=['metaboliclabeling', 'ttseq', 'netseq', 'proseq','chromatin_associated'], default='metaboliclabeling')
     parser.add_argument('--mRNAcount', type=int, default=5000)  
     parser.add_argument('--seq_err', default='0.0001,0.0002')
     parser.add_argument('--nt_inc_rate',type=str,default='0.09,0.1')
@@ -160,8 +181,8 @@ if __name__ == "__main__":
         PAS_coord = max_transcript_length
 
     data_list = []
-    from_base = args.labeling_base
-    to_base = args.sub_base
+    from_bases, conv_map = parse_conversion_map(args.labeling_base, args.sub_base)
+    to_base = args.sub_base if conv_map else None
 
     low, high = map(int, args.initi_rate.split(","))
     initiation_interval_sec = rng.integers(low, high + 1)
@@ -187,7 +208,7 @@ if __name__ == "__main__":
 
     target_sample_size = int(args.mRNAcount * args.experiment_time / 10)
 
-    if args.experiment_type in ['mnetseq', 'proseq']:
+    if args.experiment_type in ['netseq', 'proseq']:
         target_sample_size = target_sample_size * 10
 
     bkg_molecules_to_simulate = int(target_sample_size * args.bkg_molecules)
@@ -201,7 +222,7 @@ if __name__ == "__main__":
     initiations_per_unit = args.experiment_time / (initiation_interval_sec / 60)
     total_molecules_per_unit = n_pol_per_unit + bolus_per_unit + initiations_per_unit
 
-    if args.experiment_type in ['mnetseq', 'proseq']:
+    if args.experiment_type in ['netseq', 'proseq']:
         effective_molecules_per_unit = n_pol_per_unit + bolus_per_unit
     else:
         effective_molecules_per_unit = total_molecules_per_unit
@@ -302,7 +323,7 @@ if __name__ == "__main__":
         pct_sub, conv_pos, inc_pos, pct_err, err_pos = generate_mutated_read(
             dna_sequence_arr, int(physical_stop), int(eff_label_start),
             nt_incorporation_rate, sub_rate_percent_range, seqerr_range,
-            from_base, to_base, rng
+            from_bases, to_base, rng
         )
         
         spliced_introns_str = f"[[0, {int(physical_start)}]]" if physical_start > 0 else "[]"
@@ -443,7 +464,7 @@ if __name__ == "__main__":
                     'sequence': appended_seq, 'pas_coordinate': int(PAS_coord)
                 }])
                 gtf_gene = pd.concat([gtf_gene, new_row], ignore_index=True)
-                gtf_gene.to_csv(gtf_path_in, sep='\t', index=False, compression='gzip')
+                atomic_to_csv(gtf_gene, gtf_path_in, sep='\t', index=False)
 
     for mol in molecules_to_emit:
         if mol['cleaved']:
@@ -453,7 +474,7 @@ if __name__ == "__main__":
             if args.experiment_type in ['metaboliclabeling', 'ttseq','chromatin_associated']:
                 emit_molecule(0, PAS_coord, mol['start_label_pos'], "_cleaved_body", polyA_len, mol['initiation_sec'], mol['molecule_id'], mol['time_since_cleavage_sec'])
                 emit_molecule(mol['deg_front'], mol['stop_label_pos'], mol['start_label_pos'], "_readthrough_tail", 0, mol['initiation_sec'], mol['molecule_id'], mol['time_since_cleavage_sec'])
-            elif args.experiment_type in ['mnetseq', 'proseq']:
+            elif args.experiment_type in ['netseq', 'proseq']:
                 emit_molecule(mol['deg_front'], mol['stop_label_pos'], mol['start_label_pos'], "_readthrough_tail", 0, mol['initiation_sec'], mol['molecule_id'], mol['time_since_cleavage_sec'])
         else:
             emit_molecule(0, mol['stop_label_pos'], mol['start_label_pos'], "_uncleaved", 0, mol['initiation_sec'], mol['molecule_id'], 0.0)
@@ -468,7 +489,7 @@ if __name__ == "__main__":
     if len(df_for_export) > nascent_to_simulate:
         df_for_export = df_for_export.sample(n=nascent_to_simulate, random_state=42)
 
-    df_for_export.to_csv(output_filename, sep='\t', index=False, compression='gzip')
+    atomic_to_csv(df_for_export, output_filename, sep='\t', index=False)
 
     #capture mean seq_err across all nascent molecules for the ground truth
     _mean_seq_err = float(df_for_export['percentage_seq_err'].mean()) if not df_for_export.empty else 0.0
@@ -510,7 +531,7 @@ if __name__ == "__main__":
             'start_label_pos', 'stop_label_pos', 'converted_positions', 
             'incorporated_positions', 'percentage_seq_err', 'seq_err_positions', 'spliced_introns', 'polyA_length', 'time_since_cleaved_min'
         ])
-        bg_data_list_for_export.to_csv(output_filename_bg, sep='\t', index=False, compression='gzip')
+        atomic_to_csv(bg_data_list_for_export, output_filename_bg, sep='\t', index=False)
 
     parent_dir = os.path.dirname(args.o.rstrip('/'))
     temp_dir = os.path.join(parent_dir, 'temp')
@@ -518,20 +539,20 @@ if __name__ == "__main__":
 
     init_path = os.path.join(temp_dir, f"temp_{base_filename}_initiation.tsv")
     df_summary = pd.DataFrame([{"gene_id": base_filename, "initiation_rate": initiation_interval_sec}])
-    df_summary.to_csv(init_path, sep="\t", index=False)
+    atomic_to_csv(df_summary, init_path, sep="\t", index=False)
 
     elong_path = os.path.join(temp_dir, f"temp_{base_filename}_elongation.tsv")
     df_elongation = pd.DataFrame([{"gene_id": base_filename, "mean_elongation_rate": round(float(mean_elong_rate), 4)}])
-    df_elongation.to_csv(elong_path, sep="\t", index=False)
+    atomic_to_csv(df_elongation, elong_path, sep="\t", index=False)
 
     seq_err_path = os.path.join(temp_dir, f"temp_{base_filename}_seq_err.tsv")
     df_seq_err = pd.DataFrame([{"gene_id": base_filename, "mean_seq_err": round(_mean_seq_err, 8)}])
-    df_seq_err.to_csv(seq_err_path, sep="\t", index=False)
+    atomic_to_csv(df_seq_err, seq_err_path, sep="\t", index=False)
 
     pas_elong_path = os.path.join(temp_dir, f"temp_{base_filename}_pas_elong.tsv")
     pas_elong_kb_min = round(gene_pas_rate * 60 / 1000, 4)  #convert nt/sec back to kb/min
     df_pas_elong = pd.DataFrame([{"gene_id": base_filename, "PAS_elongation_rate": pas_elong_kb_min}])
-    df_pas_elong.to_csv(pas_elong_path, sep="\t", index=False)
+    atomic_to_csv(df_pas_elong, pas_elong_path, sep="\t", index=False)
 
     if not args.nocleavage and (gene_cleavage_half_life > 0 or args.immediate_cleavage):
         cleavage_path = os.path.join(temp_dir, f"temp_{base_filename}_cleavage.tsv")
@@ -543,8 +564,4 @@ if __name__ == "__main__":
             "pas_coordinates": int(PAS_coord),
             "half_life": hl_out
         }])
-        df_cleavage.to_csv(cleavage_path, sep="\t", index=False)
-
-
-
-
+        atomic_to_csv(df_cleavage, cleavage_path, sep="\t", index=False)

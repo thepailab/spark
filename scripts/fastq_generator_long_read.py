@@ -7,6 +7,7 @@ import os
 import numpy as np
 import ast
 import hashlib
+from spark_labeling import parse_conversion_map
 
 def reverse_complement(sequence):
     complement = str.maketrans('ACGTacgt', 'TGCAtgca')
@@ -22,14 +23,16 @@ def process_sequence(sequence, sequencing_type):
 def id_generator(size=12, chars=string.ascii_uppercase + string.digits):
     return "@" + ''.join(random.choice(chars) for _ in range(size - 1))   
 
-def reconstruct_main(ref_arr, stop_pos, conv_pos_str, err_pos_str, spliced_introns_str, sub_base, polyA_len):
+def reconstruct_main(ref_arr, stop_pos, conv_pos_str, err_pos_str, spliced_introns_str, conv_map, polyA_len):
     mol_arr = ref_arr[:int(stop_pos)].copy()
-    
-    if pd.notna(conv_pos_str) and conv_pos_str not in ("[]", "NA", "") and sub_base:
+
+    if pd.notna(conv_pos_str) and conv_pos_str not in ("[]", "NA", "") and conv_map:
         try:
             conv_pos = ast.literal_eval(conv_pos_str)
             valid = [p for p in conv_pos if p < len(mol_arr)]
-            if valid: mol_arr[valid] = sub_base
+            if valid:
+                orig_bases = mol_arr[valid]
+                mol_arr[valid] = [conv_map.get(b, b) for b in orig_bases]
         except: pass
             
     if pd.notna(err_pos_str) and err_pos_str not in ("[]", "NA", ""):
@@ -84,14 +87,17 @@ if __name__ == "__main__":
     parser.add_argument("--input_df")   
     parser.add_argument("--seq_type", choices=["RNA", "cDNA"], default='RNA')
     parser.add_argument('--seq_depth', type=int, default=20000000)
-    parser.add_argument('--tpm_lower_limit', type=int, default=5)
-    parser.add_argument('--tpm_upper_limit', type=int, default=200)
+    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
+    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument('-o', type=str, default='./')
     parser.add_argument("--seed", type=int)
     parser.add_argument("--bkg_molecules", type=float, default=0.0)
+    parser.add_argument("--labeling_base", type=str, default='T')
     parser.add_argument("--sub_base", type=str, default='C')
 
     args = parser.parse_args()
+
+    _from_bases, conv_map = parse_conversion_map(args.labeling_base, args.sub_base)
 
     filename = os.path.basename(args.input_df)
     base_filename = filename.replace(".tsv.gz", "")
@@ -140,14 +146,14 @@ if __name__ == "__main__":
         print(f"[Warning] GTF not found at {gtf_path}. Cannot assemble sequences.")
         exit(1)
 
-    cpm_gene = random.randint(args.tpm_lower_limit, args.tpm_upper_limit)
+    cpm_gene = random.randint(args.rpkm_lower_limit, args.rpkm_upper_limit)
     
-    temp_dir_tpm = os.path.join(args.o, "temp")
-    os.makedirs(temp_dir_tpm, exist_ok=True)
-    tpm_path = os.path.join(temp_dir_tpm, f"temp_{base_filename}_tpm.tsv")
+    temp_dir_rpkm = os.path.join(args.o, "temp")
+    os.makedirs(temp_dir_rpkm, exist_ok=True)
+    rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
     
-    df_tpm = pd.DataFrame([{"gene_id": base_filename, "tpm": cpm_gene}])
-    df_tpm.to_csv(tpm_path, sep="\t", index=False)
+    df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": cpm_gene}])
+    df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
     
     #calculate read counts
     total_reads_budget = int(round(args.seq_depth * cpm_gene / 10**6))
@@ -186,8 +192,8 @@ if __name__ == "__main__":
                         getattr(row, 'stop_label_pos', 0), 
                         getattr(row, 'converted_positions', '[]'), 
                         getattr(row, 'seq_err_positions', '[]'), 
-                        getattr(row, 'spliced_introns', '[]'), 
-                        args.sub_base,
+                        getattr(row, 'spliced_introns', '[]'),
+                        conv_map,
                         getattr(row, 'polyA_length', 0)
                     )
                     

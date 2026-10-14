@@ -8,6 +8,7 @@ import string
 import ast
 import numpy as np
 import hashlib
+from spark_labeling import parse_conversion_map
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -36,13 +37,28 @@ def get_absolute_coords(rates_df, read_start, read_end):
         abs_end = subset['absolute_position'].iloc[-1]
         strand = subset['strand'].iloc[0]
         return f"{chrom}:{abs_start}-{abs_end}:{strand}"
+    # Read falls outside the annotated gene body (nucleotide_coord 1..gene_length,
+    # i.e. TSS..PAS) -- e.g. the post-PAS read-through region of uncleaved /
+    # readthrough_tail molecules. absolute_position is a strictly linear function of
+    # nucleotide_coord per gene, so extrapolate from the anchor row instead of "NA".
+    chrom = rates_df['chromosome'].iloc[0]
+    strand = rates_df['strand'].iloc[0]
+    anchor = rates_df.loc[rates_df['nucleotide_coord'].idxmin()]
+    n0 = int(anchor['nucleotide_coord'])
+    a0 = int(anchor['absolute_position'])
+    if strand == '+':
+        abs_start = a0 + (read_start - n0)
+        abs_end = a0 + (read_end - n0)
     else:
-        return "NA"
+        abs_start = a0 - (read_start - n0)
+        abs_end = a0 - (read_end - n0)
+    return f"{chrom}:{abs_start}-{abs_end}:{strand}"
 
 def process_and_write_fastq(
     df_sampled, lookup_dict, output_prefix, sequencing_type, 
-    strandedness, read_length, rates_df, ref_arr, bg_ref_arr, sub_base='C', ttseq=False
+    strandedness, read_length, rates_df, ref_arr, bg_ref_arr, conv_map=None, ttseq=False
 ):
+    conv_map = conv_map or {}
     if sequencing_type == "SE":
         f_out = gzip.open(f"{output_prefix}.fastq.gz", 'wt')
     else:
@@ -68,7 +84,9 @@ def process_and_write_fastq(
                 
                 is_inc[inc_pos] = True
                 is_conv[conv_pos] = True
-                if sub_base: mol_arr[conv_pos] = sub_base
+                if conv_map and conv_pos:
+                    orig_bases = mol_arr[conv_pos]
+                    mol_arr[conv_pos] = [conv_map.get(b, b) for b in orig_bases]
                 
                 for p in err_pos:
                     mol_arr[p] = random.choice([b for b in ['A','C','G','T'] if b != mol_arr[p]])
@@ -191,8 +209,8 @@ if __name__ == "__main__":
     parser.add_argument("--s", choices=["rf", "fr","unstranded"], type=str, default='rf')
     parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--tpm_lower_limit', type=int, default=5)
-    parser.add_argument('--tpm_upper_limit', type=int, default=200)
+    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
+    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument("--fragments", action="store_true")
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
@@ -200,10 +218,13 @@ if __name__ == "__main__":
     parser.add_argument("--bkg_molecules", type=float, default=0.0)
     parser.add_argument("--sizeselectiontype", choices=["none", "hardcut", "probabilistic"], default="probabilistic")
     parser.add_argument("--no_fragmentation", action="store_true")
+    parser.add_argument("--labeling_base", type=str, default='T')
     parser.add_argument("--sub_base", type=str, default='C')
     parser.add_argument("--experiment_type", type=str, default="metaboliclabeling")
 
     args = parser.parse_args()
+
+    _from_bases, conv_map = parse_conversion_map(args.labeling_base, args.sub_base)
 
     filename = os.path.basename(args.input_df)
     base_filename = filename.replace(".tsv.gz", "")
@@ -223,8 +244,8 @@ if __name__ == "__main__":
             f"--read_length {args.read_length}",
             f"--threads {args.threads}",
             f"--seq_depth {args.seq_depth}",
-            f"--tpm_lower_limit {args.tpm_lower_limit}",
-            f"--tpm_upper_limit {args.tpm_upper_limit}",
+            f"--rpkm_lower_limit {args.rpkm_lower_limit}",
+            f"--rpkm_upper_limit {args.rpkm_upper_limit}",
             f"-o {args.o}",
             f"--sizeselectiontype {args.sizeselectiontype}"
         ]
@@ -310,20 +331,20 @@ if __name__ == "__main__":
     except (FileNotFoundError, pd.errors.EmptyDataError, KeyError):
         df_exploded = pd.DataFrame(columns=['transcript_id', 'read_start', 'read_end'])
 
-    gene_tpm = np.random.uniform(low=int(args.tpm_lower_limit), high=int(args.tpm_upper_limit))
+    gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
     
     
-    temp_dir_tpm = os.path.join(args.o, "temp")
-    os.makedirs(temp_dir_tpm, exist_ok=True)
-    tpm_path = os.path.join(temp_dir_tpm, f"temp_{base_filename}_tpm.tsv")
+    temp_dir_rpkm = os.path.join(args.o, "temp")
+    os.makedirs(temp_dir_rpkm, exist_ok=True)
+    rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
     
-    df_tpm = pd.DataFrame([{"gene_id": base_filename, "tpm": gene_tpm}])
-    df_tpm.to_csv(tpm_path, sep="\t", index=False)
+    df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
+    df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
     
 
     seq_depth_million = args.seq_depth / 1e6
     
-    total_reads_budget = int(gene_length * gene_tpm * seq_depth_million)
+    total_reads_budget = int(gene_length * gene_rpkm * seq_depth_million)
     
     if args.bkg_molecules > 0.0:
         reads_to_get_bg = int(total_reads_budget * args.bkg_molecules)
@@ -363,8 +384,8 @@ if __name__ == "__main__":
                 f"--read_length {args.read_length}",
                 f"--threads {args.threads}",
                 f"--seq_depth {args.seq_depth}",
-                f"--tpm_lower_limit {args.tpm_lower_limit}",
-                f"--tpm_upper_limit {args.tpm_upper_limit}",
+                f"--rpkm_lower_limit {args.rpkm_lower_limit}",
+                f"--rpkm_upper_limit {args.rpkm_upper_limit}",
                 f"-o {args.o}",
                 f"--sizeselectiontype {args.sizeselectiontype}"
             ]
@@ -437,7 +458,7 @@ if __name__ == "__main__":
         rates_df, 
         ref_arr,
         bg_ref_arr,
-        sub_base=args.sub_base,
+        conv_map=conv_map,
         ttseq=False
     )
 
@@ -447,4 +468,5 @@ if __name__ == "__main__":
         if 'chopped_bg_path' in locals() and os.path.exists(chopped_bg_path):
             os.remove(chopped_bg_path)
     except OSError: pass
+
 

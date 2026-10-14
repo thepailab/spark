@@ -1,6 +1,8 @@
 ﻿# SPARK: simulated pre-mRNA and RNA kinetics
 SPARK (Simulated Pre-mRNA and RNA Kinetics) is a comprehensive simulation framework for generating nascent RNA benchmarking datasets. SPARK uses real annotated gene sequences to simulate nascent RNA sequencing reads after performing in silico transcription, co-transcriptional RNA processing (splicing, cleavage and polyadenylation), nascent RNA enrichment, and library preparation steps.
-In brief, these simulations start from annotated mRNA isoforms and assign transcription elongation rates to each nucleotide across a chosen number of genes. Simulated RNA Polymerase II (RNAPII) is then walked across each gene for a user-defined labeling time, producing nascent pre-mRNAs that can be co or post-transcriptionally spliced, cleaved, and polyadenylated. User-defined simulation parameters can be tuned to vary across a range of experimental conditions, and SPARK can reproduce a wide variety of nascent RNA sequencing approaches. During in silico RNA synthesis, users can choose methods that either mimic metabolic labeling or labeling of RNAPII positions: to simulate metabolic labeling approaches like 4sU-seq or TT-seq, SPARK simulates the stochastic incorporation of nucleotide analogues (e.g., 4sU, 5-ethynyluridine (5eU)), while the incorporation of a "biotin-NTP" recreates the process of transcription termination inherent to run-on assays like PRO-seq. SPARK can also retain the chromatin-associated RNA fraction to mimic chromatin-associated RNA-seq (caRNA-seq).
+
+In brief, these simulations start from annotated mRNA isoforms and assign transcription elongation rates to each nucleotide across a chosen number of genes. Simulated RNA Polymerase II (RNAPII) is then walked across each gene for a user-defined labeling time, producing nascent pre-mRNAs that can be co- or post-transcriptionally spliced, cleaved, and polyadenylated. User-defined simulation parameters can be tuned to vary across a range of experimental conditions, and SPARK can reproduce a wide variety of nascent RNA sequencing approaches. During in silico RNA synthesis, users can choose methods that either mimic metabolic labeling or labeling of RNAPII positions: to simulate metabolic labeling approaches like 4sU-seq or TT-seq, SPARK simulates the stochastic incorporation of nucleotide analogues (e.g., 4sU, 5-ethynyluridine (5eU)), while the incorporation of a "biotin-NTP" recreates the process of transcription termination inherent to run-on assays like PRO-seq. SPARK can also retain the chromatin-associated RNA fraction to mimic chromatin-associated RNA-seq (caRNA-seq).
+
 [![](https://github.com/ezecalvo/spark/raw/master/figures/SPARK_summary.png)](/ezecalvo/spark/blob/master/figures/SPARK_summary.png)
 ### Requirements (versions used for development)
 - python (v3.12.9)
@@ -23,7 +25,7 @@ In brief, these simulations start from annotated mRNA isoforms and assign transc
 - scales (v1.3.0)
 A spark.yml conda environment is provided and can be installed by running
 ```
-conda create --file environment.yml
+conda env create -f spark.yml
 ```
 ## Table of Contents
 
@@ -52,7 +54,7 @@ conda create --file environment.yml
 - [Metabolic labeling RNA enrichment](#metabolic-labeling-rna-enrichment)
 - [Transient transcriptome (TT)-seq](#transient-transcriptome-tt-seq)
 - [Precision Nuclear Run-on (PRO)-seq](#precision-nuclear-run-on-pro-seq)
-- [mammalian Native Elongating Transcript (mNET)-seq](#mammalian-native-elongating-transcript-mnet-seq)
+- [Native Elongating Transcript (NET)-seq](#native-elongating-transcript-net-seq)
 - [Chromatin-associated RNA](#chromatin-associated-rna)
 
 
@@ -87,18 +89,18 @@ spark.py --show_presets
 | `TTseq` | Transient transcriptome (TT)-seq | ttseq | T | none | 0.005,0.023 | 0.10 |
 | `TT-TimelapseSeq` | TT-TimeLapse-seq (T→C recoding) | ttseq | T | C | 0.005,0.023 | 0.05 |
 | `eSLAM-seq` | eSLAM-seq / enriched TimeLapse-seq (T→C recoding) | metaboliclabeling | T | C | 0.005,0.023 | 0.10 |
-| `proseq` | Precision Nuclear Run-on (PRO)-seq | proseq | T | — | — | 0.02 |
-| `mNETseq` | mammalian Native Elongating Transcript (mNET)-seq | mnetseq | — | — | — | 0.10 |
+| `proseq` | Precision Nuclear Run-on (PRO)-seq | proseq | A,C,G,T | — | — | 0.02 |
+| `NETseq` | Native Elongating Transcript (NET)-seq | netseq | — | — | — | 0.10 |
 | `chromatinassociated` | Chromatin-associated RNA-seq | chromatin_associated | — | — | — | 0.20 |
 | `polyA` | Steady-state polyA | — | — | none | — | — |
 
-Presets can also be customized by additional flags on top of it. For example, to run the mNETseq preset but with deeper sequencing library:
+Presets can also be customized by additional flags on top of it. For example, to run the NETseq preset but with deeper sequencing library:
 ```
-spark.py --preset mNETseq -o ./out_dir/ --n 1000 \
+spark.py --preset NETseq -o ./out_dir/ --n 1000 \
 --gtf GRCh38.95.gtf --genome_fasta GRCh38.fa \
 --seq_type PE --experiment_time 30 --seq_depth 40000000
 ```
-The final simulated libraries will be located in the `out_dir/final_libraries/` directory. The file names are designed to be informative and follow a consistent structure. One fastq file is generated per read (e.g., R1 and R2 for paired-end). The naming convention is `{seq_tech}_{experiment_type}_{seq_type}_{date}_{read}.fastq.gz`. For example, for a paired-end, short-read metabolic labeling experiment simulated on November 3, 2025, these are the output files:
+The final simulated libraries will be located in the `out_dir/final_libraries/` directory. One fastq file is generated per read (e.g., R1 and R2 for paired-end). The naming convention is `{seq_tech}_{experiment_type}_{seq_type}_{date}_{read}.fastq.gz`. For example, for a paired-end, short-read metabolic labeling experiment simulated on November 3, 2025, these are the output files:
 
 
 ```
@@ -116,17 +118,20 @@ usage: spark.py
 
 general arguments:
   -h, --help            show this help message and exit
-  --mode {fullpipeline,gene_selection,rates_per_region,mRNAgeneration,seq_tech}
+  --mode {fullpipeline,gene_selection,rates_per_region,mRNAgeneration,readgeneration}
                         pipeline step to run (default: fullpipeline)
   -o O                  output directory (default: ./)
   --seed SEED           random seed for reproducibility (default: None)
-  --experiment_type {metaboliclabeling,proseq,ttseq,mnetseq,chromatin_associated}
+  --experiment_type {metaboliclabeling,proseq,ttseq,netseq,chromatin_associated}
                         type of experiment to simulate (default: metaboliclabeling)
   --threads THREADS     number of threads for parallel processing (default: 1)
+  --remove_temp         delete intermediate files as soon as no later step needs them, keeping only the final
+                        libraries, ground truth files and the log. Files still needed by a later --mode step are
+                        kept until that step runs (default: False)
 
 
 presets:
-  --preset {default,DRB4sUseq,4sUseq,TTseq,BrUseq,mNETseq,proseq,chromatinassociated,TT-TimelapseSeq,eSLAM-seq,polyA}
+  --preset {default,DRB4sUseq,4sUseq,TTseq,BrUseq,NETseq,proseq,chromatinassociated,TT-TimelapseSeq,eSLAM-seq,polyA}
                         load a predefined set of parameters (default: default)
   --show_presets        display all available presets and their default values, then exit
 
@@ -144,7 +149,7 @@ gene selection:
 
 rates per region:
   --region_size_range REGION_SIZE_RANGE
-                        range of elongation rate region sizes to split the gene into (default: 500,1000)
+                        range of elongation rate region sizes to split the gene into (default: 500,5000)
   --num_regions NUM_REGIONS
                         number of elongation rate regions to split the gene into
   --elong_rate_range ELONG_RATE_RANGE
@@ -170,9 +175,12 @@ pre-mRNA generation:
                         range of nucleotide incorporation probability (default: 0.005,0.023)
   --subs_prob SUBS_PROB
                         range of nucleotide substitution probability if simulating nucleotide recoding (default: 0.95,1)
-  --labeling_base {A,C,T,G}
-                        base analog that gets incorporated into the nascent RNA (default: T)
-  --sub_base {A,C,T,G}  identity of the base after conversion (default: None)
+  --labeling_base LABELING_BASE
+                        base analog(s) incorporated into the nascent RNA. A single base or a comma-separated
+                        list, e.g. "T" or "A,T" (default: T)
+  --sub_base SUB_BASE   identity of the base(s) after conversion, matched positionally to --labeling_base, e.g.
+                        "C" or "G,C" (A->G and T->C). A single value is applied to every labeling base. Omit
+                        for incorporation without recoding (default: None)
   --bkg_molecules BKG_MOLECULES
                         proportion of mRNA molecules made before the start of the experiment (not nascent) (default: 0)
   --drb                 simulate a DRB treatment experiment for transcription synchronization (default: False)
@@ -224,7 +232,7 @@ Snippet to simulate 150nt rf-firststrand paired-end reads from 1000 genes from a
 ```
 spark.py --mode fullpipeline -o ./out_dir/ --experiment_type ttseq --n 1000 --gtf GRCh38.95.gtf --genome_fasta GRCh38.fa --s rf --seq_type PE --experiment_time 5 --read_length 150
 ```
-SPARK can be run in full or as specific modules to change specific parameters of the simulation while keeping others constant. Users can choose to input a seed to replicate the randomly assigned values (e.g., elongation rates) across runs.
+SPARK can be run in full or as specific modules to change specific parameters of the simulation while keeping others constant. Users can choose to input a seed to replicate the randomly assigned values (e.g., elongation rates, intron splicing rates, RNA fragmentation, etc) across runs.
 ### Reusing Simulated Data Across Runs
 
 
@@ -240,19 +248,29 @@ spark.py --mode fullpipeline -o ./out_dir/ \
 ```
 
 
-Next, to run an mNET-seq experiment using the exact same simulated mRNAs from the first run, just point to that same output directory. `spark.py` will automatically detect and reuse the existing data with a different enrichment method (see below).
+Next, to run a NET-seq experiment using the exact same simulated mRNAs from the first run, just point to that same output directory. `spark.py` will automatically detect and reuse the existing data with a different enrichment method (see below). Alternatively, the metaboliclabeling and the NET-seq runs can be used under the fullpipeline mode and the same seed.
 
 
 ```
-# Run 2: Reuses mRNAs from Run 1 to generate an mNET-seq experiment
-spark.py --mode seq_tech -o ./out_dir/ --experiment_type mnetseq --s rf --seq_type PE
+# Run 2: Reuses mRNAs from Run 1 to generate a NET-seq experiment
+spark.py --mode readgeneration -o ./out_dir/ --experiment_type netseq --s rf --seq_type PE
 ```
+### Removing intermediate files
+By default, SPARK keeps every intermediate file it creates in the output directory (per-gene sequences, pre-mRNA and mRNA tables, per-gene reads, etc.). This is what allows reusing simulated data across runs, but it can take a lot of disk space for large simulations. Adding `--remove_temp` deletes each intermediate file as soon as no later step needs it, which also keeps disk usage low while the pipeline is running. At the end of a full run, the output directory only contains:
+- `final_libraries/`
+- `ground_truth_per_gene.tsv`
+- `rate_per_gene/` (elongation rates & pausing ground truth)
+- `intron_half_lives/` (when splicing is simulated)
+- `ground_truth_pre_size_selection/` and `ground_truth_after_size_selection/` (when `--fragments` is used)
+- `spark_pipeline.log`
+
+When running individual modes, files needed by a later mode are kept until that mode runs (e.g., `--mode mRNAgeneration --remove_temp` keeps the simulated mRNAs for `--mode readgeneration`). Because intermediate files are deleted, the output of a run with `--remove_temp` cannot be reused by later runs as described above.
 ### Step 1: Gene Selection
 **Clustering by gene features (`--mode gene_selection`)**
 SPARK is designed to select genes from which to simulate nascent RNA reads that represent a diversity of genomic features. Users specify the number of genes from which they would like to simulate reads and provide: (1) a gtf with gene annotations and (2) a reference fasta file. For each gene, the longest isoform (upstream-most transcript start site and downstream-most transcript end site) is selected, and its features are used for classification. Genes in the gtf are first categorized by gene length, total transcript length(s), number of exons, mean exon lengths, number of introns, mean intron lengths, first intron length, lengths of 5′ and 3′ untranslated regions (UTRs), and exonic and intronic nucleotide composition. Hierarchical clustering is used to identify clusters of transcripts with similar characteristics.
-The number of genes to simulate can be established using `--n` (set `--n 0` to simulate every gene in the GTF), and the number of clusters to divide genes into can be changed with `--n_gene_clusters`. An equal number of genes is selected from each cluster for downstream simulations, ensuring a balanced and unbiased set of genes reflecting genome diversity. SPARK can also simulate genes for any species with annotated genomes and selected genes from a pre-filtered gtf file.[a]
+The number of genes to simulate can be established using `--n` (set `--n 0` to simulate every gene in the GTF), and the number of clusters to divide genes into can be changed with `--n_gene_clusters`. An equal number of genes is selected from each cluster for downstream simulations, ensuring a balanced and unbiased set of genes reflecting genome diversity. SPARK can also simulate genes for any species with annotated genomes and selected genes from a pre-filtered gtf file.
   
-[b]
+
 To simulate multiple isoforms per gene, users can provide a gtf were each isoform to simulate has a different gene id.
 [![](https://github.com/ezecalvo/spark/raw/master/figures/gene_clustering.png)](/ezecalvo/spark/blob/master/figures/gene_clustering.png)
 ### Step 2: Elongation Rates
@@ -271,12 +289,12 @@ Two output files per gene will be created in a new directory named *rate_per_gen
 ### Step 3: Nascent RNA generation
 **pre-mRNA generation (`--mode mRNAgeneration`)**
 SPARK first simulates full-length pre-mRNA isoforms based on the elongation rates generated by `--mode rates_per_region`. Using these rates, transcription is simulated to create nascent pre-mRNA transcripts. The length of the experiment is specified by `--experiment_time`, which is used to calculate a total traveled distance by each RNAPII considering the cumulative elongation rates across the gene. These molecules can be labeled with a nucleotide analog or not, depending on the specified `--experiment_type`. The total number of mRNA molecules simulated per gene is set by `--mRNAcount`.
-For nucleoside-analog dependent experiment types (`--experiment_type metaboliclabeling`, `--experiment_type proseq`, or `--experiment_type ttseq`), SPARK will simulate temporally-resolved nascent RNA sequencing using metabolic labeling. There are several parameters that determine the labeling probability, detection, and efficiency. During this "time", the probability that a labeled nucleotide specified with `--labeling_base` is *in silico* incorporated into nascent RNA molecules is specified by `--nt_inc_prob`. Once incorporated, the probability that these labeled nucleotides undergo nucleoside re-encoding is specified by `--subs_prob`. The nature of this re-encoding is specified by `--sub_base`. For example, iodoacetamide or TFEA-induced re-encoding of 4sU results in a T-to-C conversion, so `--labeling_base T --sub_base C` would simulate eSLAM-seq or enriched TimeLapse-seq experiments.
+For nucleoside-analog dependent experiment types (`--experiment_type metaboliclabeling`, `--experiment_type proseq`, or `--experiment_type ttseq`), SPARK will simulate temporally-resolved nascent RNA sequencing using metabolic labeling. There are several parameters that determine the labeling probability, detection, and efficiency. During this "time", the probability that a labeled nucleotide specified with `--labeling_base` is *in silico* incorporated into nascent RNA molecules is specified by `--nt_inc_prob`. Once incorporated, the probability that these labeled nucleotides undergo nucleoside re-encoding is specified by `--subs_prob`. The nature of this re-encoding is specified by `--sub_base`. For example, iodoacetamide or TFEA-induced re-encoding of 4sU results in a T-to-C conversion, so `--labeling_base T --sub_base C` would simulate eSLAM-seq or enriched TimeLapse-seq experiments. Several bases can be labeled at once by giving `--labeling_base` a comma-separated list (e.g., `A,C,G,T`). `--sub_base` is then matched positionally (e.g., `--labeling_base A,T --sub_base G,C` simulates A-to-G and T-to-C conversions), and a single `--sub_base` value is applied to every labeling base.
 Two transcriptional conditions can be simulated using `--drb`:
 (1) RNA enrichment after transcription synchronization with DRB (*i.e.* 4sUDRB-seq), such that all RNAPIIs initiate at the transcription start site at the start of the labeling window (including `--drb`).
 (2) A native context assuming steady-state transcription, in which RNAPII are already distributed across the gene body when labeling begins (default, not including `--drb`).
 ### Step 4: RNA processing
-After nascent pre-mRNAs are generated, SPARK simulates the co-transcriptional RNA processing events of splicing, 3′-end cleavage, and polyadenylation. These steps are applied to the population of nascent molecules before enrichment, so the kinetics of each process shape 
+After nascent pre-mRNAs are generated, SPARK simulates the co-transcriptional RNA processing events of splicing, 3′-end cleavage, and polyadenylation. These steps are applied to the population of nascent molecules before enrichment.
 #### Splicing
 SPARK simulates co-transcriptional splicing as a first-order kinetic process per intron (`spark_spliceosome.py`). Each intron is assigned a half-life drawn from the range set by `--intron_half_life`. For every molecule, the time available for splicing an intron is the interval between when its 3′ splice site finished being transcribed and the molecule's current position in time; an intron is removed with probability `1 - exp(-t / mean_life)`, where `mean_life = half_life / ln(2)`. As a result, longer-lived introns and recently transcribed introns are more likely to be retained, recapitulating the co-transcriptional nature of splicing. Splicing can be turned off entirely with `--nosplicing`, in which case transcripts are treated as continuous, unspliced isoforms.
 [![](https://github.com/ezecalvo/spark/raw/master/figures/splicing.png)]
@@ -290,9 +308,9 @@ The metabolic labeling enrichment mode (`--experiment_type metaboliclabeling`) s
 #### Transient transcriptome (TT)-seq
 The TT-seq experimental mode (`--experiment_type ttseq`) simulates a TT-seq style experiment by performing *in silico* fragmentation (see below) directly after full-length RNA generation and labeling but before nascent RNA enrichment. After this fragmentation, SPARK enriches for nascent RNA fragments (rather than nascent RNA molecules). Fragments that do not contain at least one nucleotide analog are discarded from the population of fragments before proceeding to library preparation.
 #### Precision Nuclear Run-on (PRO)-seq
-The PRO-seq experimental mode (`--experiment_type proseq`) simulates a run-on assay by simulating the incorporation of a biotinylated nucleotide during the *in silico* transcription process. The most upstream biotin-NTP incorporation event then defines the 3′ terminus of the nascent transcript by truncating the molecule at that nucleotide. Truncated molecules then proceed to the *in silico* fragmentation module (see below), in which only the 3′-most fragment containing the singular biotin-NTP is retained for subsequent library preparation simulation.
-#### mammalian Native Elongating Transcript (mNET)-seq
-The mNET-seq experimental mode (`--experiment_type mnetseq`) simulates RNAPII pulldown-based nascent RNA sequencing assays by identifying all molecules actively undergoing elongation at the end of the simulated experiment time. The simulation mimics RNAPII pulldown followed by MNase digestion. For each actively transcribing molecule (RNAPII has not reached the 3′ end of the gene), SPARK extracts the 3′-terminal fragment that represents the nascent RNA physically protected by the RNAPII complex by selecting the last N nt of the molecule, where N is drawn from a uniform distribution between 35–100 nucleotides. Only these 3′ fragments are retained for subsequent library preparation steps.
+The PRO-seq experimental mode (`--experiment_type proseq`) simulates a run-on assay by simulating the incorporation of a biotinylated nucleotide during the *in silico* transcription process. The most upstream biotin-NTP incorporation event then defines the 3′ terminus of the nascent transcript by truncating the molecule at that nucleotide. Truncated molecules then proceed to the *in silico* fragmentation module (see below), in which only the 3′-most fragment containing the singular biotin-NTP is retained for subsequent library preparation simulation. The `proseq` preset allows biotin-NTP incorporation at all four bases (`--labeling_base A,C,G,T`), so the run-on can stop at any nucleotide.
+#### Native Elongating Transcript (NET)-seq
+The NET-seq experimental mode (`--experiment_type netseq`) simulates RNAPII pulldown-based nascent RNA sequencing assays (e.g., NET-seq and mNET-seq) by identifying all molecules actively undergoing elongation at the end of the simulated experiment time. The simulation mimics RNAPII pulldown followed by MNase digestion. For each actively transcribing molecule (RNAPII has not reached the 3′ end of the gene), SPARK extracts the 3′-terminal fragment that represents the nascent RNA physically protected by the RNAPII complex by selecting the last N nt of the molecule, where N is drawn from a uniform distribution between 35–100 nucleotides. Only these 3′ fragments are retained for subsequent library preparation steps.
 
 
 #### Chromatin-associated RNA
@@ -302,21 +320,21 @@ SPARK also allows for the introduction of two background signal sources:
 Errors (substitutions) are introduced by technical steps in the experiment (e.g., base calling from sequencing). These errors can be incorporated by specifying `--seq_err`, which sets the probability that there will be a random substitution at any base in the molecule.
 Background, non-nascent transcripts. These are transcripts that are not transcribed during the labeling window, but may be present due to inefficient or non-specific enrichment. This is specified by `--bkg_molecules`, which sets a proportion of the molecules derived from background depending on the chosen `--experiment_type`:
 - For metabolic labeling, it is the proportion of mRNA molecules generated that are full-length and have no labeling nucleotides.
-- For mNET-seq, it is a random fragment of 35–100nt generated from the full-length molecule.
+- For NET-seq, it is a random fragment of 35–100nt generated from the full-length molecule.
 - For PRO-seq, it is the proportion of unlabeled fragments (with no NTP-biotin) that are kept after the fragmentation step.
 - For TT-seq, it is the proportion of unlabeled fragments (no nucleoside analog) that are kept after the fragmentation step.
 - For chromatin-associated, it is the proportion of background molecules carried through the chromatin isolation step.
 Background molecules are assumed to be fully elongated pre-mRNA molecules representing transcripts not generated during the labeling window. Setting `--bkg_molecules 1` (as in the `polyA` preset) produces a population that is entirely background, approximating a steady-state total/polyA RNA-seq library.
 ### Step 6: Read Generation
-**Read generation (`--mode seq_tech`)**
+**Read generation (`--mode readgeneration`)**
 SPARK can generate either short-read or long-read sequencing reads from the RNA molecules produced by the enrichment step. The choice of sequencing technology is specified by `--seq_tech`, which has options for *shortread* (e.g. Illumina) or *longread* (e.g., Oxford Nanopore Technologies). 
-To simulate the number of reads that might be generated by genes that are expressed at different levels, a gene expression level is chosen from the range specified by `--tpm`. The number of reads is also dependent on `--seq_depth`, which defines the total number in the *in silico* library.
+To simulate the number of reads that might be generated by genes that are expressed at different levels, a gene expression level (RPKM) is chosen from the range specified by `--rpkm`. The number of reads is also dependent on `--seq_depth`, which defines the total number in the *in silico* library.
 For short-read simulations, fragmentation and size selection are modeled after the simulations described in [Pai *et al.*, eLife 2017](https://elifesciences.org/articles/32537). Fragment insert sizes are specified by `--insert_size`. Read length is specified by `--read_length`. The simulation of single-end (*SE*) or paired-end (*PE*) is specified by `--seq_type`. Finally, strandedness is specified by `--s`, choosing from reverse-forward (*rf*), forward-reverse (*fr*), or *unstranded*. The default is *rf*, which is typical for dUTP-based strand-specific RNA-seq protocols.
 For long-read data, SPARK defaults to Oxford Nanopore strand specifications: for directRNA, transcripts are sequenced in the 3′ to 5′ direction, while cDNA reads may originate from either end. This behavior is specified by `--seq_type`, which can be set to "RNA" or "cDNA" for long reads.
 ### Ground truth
 SPARK can output multiple types of ground truth that can be used to validate a diversity of benchmarking metrics.
 #### Consolidated per-gene ground truth
-At the end of a run, SPARK consolidates the per-gene ground truth metrics produced by each module into a single `out_dir/ground_truth_per_gene.tsv` file. Depending on the simulated conditions, this table can include the initiation rate, TSS pause position and duration, minimum/maximum/mean elongation rates, the number and duration of pauses and their positions, the cleavage half-life, the post-PAS (read-through) elongation rate, the assigned TPM, the mean sequencing error, and—for chromatin-associated runs—the chromatin release half-life.
+At the end of a run, SPARK consolidates the per-gene ground truth metrics produced by each module into a single `out_dir/ground_truth_per_gene.tsv` file. Depending on the simulated conditions, this table can include the initiation rate, TSS pause position and duration, minimum/maximum/mean elongation rates, the number and duration of pauses and their positions, the cleavage half-life, the post-PAS (read-through) elongation rate, the assigned RPKM (and the TPM derived from it), the mean sequencing error, and—for chromatin-associated runs—the chromatin release half-life.
 
 
 
@@ -324,7 +342,7 @@ At the end of a run, SPARK consolidates the per-gene ground truth metrics produc
 
 
 #### Elongation rates & pausing
-1. Regions over which elongation rates are varied, including the position of pausing events, which are stored in the `out_dir/rate_per_gene/*_VariableElongationRateRegions.tsv` files containing the elongation rate information per region:
+1. Regions over which elongation rates are varied, including the position of pausing events, which are stored in the `out_dir/rate_per_gene/*_VariableElongationRateRegions.gtf` files containing the elongation rate information per region:
 | Column Name | Description |
 | --- | --- |
 | chromosome | gene chromosome |
@@ -339,7 +357,7 @@ At the end of a run, SPARK consolidates the per-gene ground truth metrics produc
 | time_to_traverse | time to traverse the entire region |
 | sequence | region sequence |
 | region_number | gene region the nucleotide belongs to |
-2. Per nucleotide elongation rates, including the position of pausing events, which is stored in the `out_dir/rate_per_gene/*_RatesandTraversalTimes.tsv` files:
+2. Per nucleotide elongation rates, including the position of pausing events, which is stored in the `out_dir/rate_per_gene/*_RatesandTraversalTimes.gtf` files:
 | Column Name | Description |
 | --- | --- |
 | chromosome | gene chromosome |
@@ -405,5 +423,3 @@ Position of the substitutions in the read: NA
 
 
 
-[a]Reviewer suggested to say this
-[b]Update
