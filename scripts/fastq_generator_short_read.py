@@ -8,7 +8,9 @@ import string
 import ast
 import numpy as np
 import hashlib
+import sys
 from spark_labeling import parse_conversion_map
+from spark_reads import pool_paths, write_units, read_pool, remove_paths, sample_rows, count_rows, explode_fragments, gene_references, coordinate_mapper
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -25,39 +27,11 @@ def reverse_complement(seq):
 def process_sequence(sequence, reverse_comp=False):
     return reverse_complement(sequence) if reverse_comp else sequence
 
-def get_absolute_coords(rates_df, read_start, read_end):
-    if rates_df.empty: return "NA"
-    subset = rates_df[
-        (rates_df['nucleotide_coord'] >= read_start) & 
-        (rates_df['nucleotide_coord'] <= read_end)
-    ]
-    if not subset.empty:
-        chrom = subset['chromosome'].iloc[0]
-        abs_start = subset['absolute_position'].iloc[0]
-        abs_end = subset['absolute_position'].iloc[-1]
-        strand = subset['strand'].iloc[0]
-        return f"{chrom}:{abs_start}-{abs_end}:{strand}"
-    # Read falls outside the annotated gene body (nucleotide_coord 1..gene_length,
-    # i.e. TSS..PAS) -- e.g. the post-PAS read-through region of uncleaved /
-    # readthrough_tail molecules. absolute_position is a strictly linear function of
-    # nucleotide_coord per gene, so extrapolate from the anchor row instead of "NA".
-    chrom = rates_df['chromosome'].iloc[0]
-    strand = rates_df['strand'].iloc[0]
-    anchor = rates_df.loc[rates_df['nucleotide_coord'].idxmin()]
-    n0 = int(anchor['nucleotide_coord'])
-    a0 = int(anchor['absolute_position'])
-    if strand == '+':
-        abs_start = a0 + (read_start - n0)
-        abs_end = a0 + (read_end - n0)
-    else:
-        abs_start = a0 - (read_start - n0)
-        abs_end = a0 - (read_end - n0)
-    return f"{chrom}:{abs_start}-{abs_end}:{strand}"
-
 def process_and_write_fastq(
     df_sampled, lookup_dict, output_prefix, sequencing_type, 
     strandedness, read_length, rates_df, ref_arr, bg_ref_arr, conv_map=None, ttseq=False
 ):
+    to_absolute = coordinate_mapper(rates_df, extrapolate=True)
     conv_map = conv_map or {}
     if sequencing_type == "SE":
         f_out = gzip.open(f"{output_prefix}.fastq.gz", 'wt')
@@ -129,11 +103,11 @@ def process_and_write_fastq(
 
             abs_u_start = orig_idx_arr[upstream_start] if upstream_start < len(orig_idx_arr) else 0
             abs_u_end = orig_idx_arr[upstream_end - 1] if upstream_end > upstream_start else 0
-            coords_up = get_absolute_coords(rates_df, abs_u_start, abs_u_end)
+            coords_up = to_absolute(abs_u_start, abs_u_end)
             
             abs_d_start = orig_idx_arr[downstream_start] if downstream_start < len(orig_idx_arr) else 0
             abs_d_end = orig_idx_arr[downstream_end - 1] if downstream_end > downstream_start else 0
-            coords_down = get_absolute_coords(rates_df, abs_d_start, abs_d_end)
+            coords_down = to_absolute(abs_d_start, abs_d_end)
 
             random_suffix = make_random_suffix()
 
@@ -192,6 +166,22 @@ def process_and_write_fastq(
             f1_out.close()
             f2_out.close()
 
+def run_chopper(tsv_path, args, with_ground_truth):
+    cmd_chop = [
+        f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
+        "--mode normal",
+        f"--tsv {tsv_path}",
+        f"--insert_size {args.insert_size}",
+        f"--read_length {args.read_length}",
+        f"--threads {args.threads}",
+        f"-o {args.o}",
+        f"--sizeselectiontype {args.sizeselectiontype}"
+    ]
+    if args.seed is not None: cmd_chop += ['--seed', str(args.seed)]
+    if with_ground_truth: cmd_chop += ['--fragments with_ground_truth']
+    if args.no_fragmentation: cmd_chop += ['--no_fragmentation']
+    run_cmd(" ".join(cmd_chop))
+
 def safe_eval(val):
     if pd.isna(val) or val == 'NA': return []
     if isinstance(val, str):
@@ -207,10 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--read_length", type=int, default=100)
     parser.add_argument("--seq_type", choices=["PE", "SE"], type=str, default='SE')
     parser.add_argument("--s", choices=["rf", "fr","unstranded"], type=str, default='rf')
-    parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
-    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument("--fragments", action="store_true")
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
@@ -221,6 +208,9 @@ if __name__ == "__main__":
     parser.add_argument("--labeling_base", type=str, default='T')
     parser.add_argument("--sub_base", type=str, default='C')
     parser.add_argument("--experiment_type", type=str, default="metaboliclabeling")
+    parser.add_argument("--prepare", action="store_true", help="build the fragment pools and count them instead of writing reads")
+    parser.add_argument("--nascent_reads", type=int, default=0)
+    parser.add_argument("--bkg_reads", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -236,63 +226,42 @@ if __name__ == "__main__":
         random.seed(unique_seed)
         np.random.seed(unique_seed)
 
-    cmd_chop = [
-            f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
-            "--mode normal",
-            f"--tsv {args.input_df}",
-            f"--insert_size {args.insert_size}",
-            f"--read_length {args.read_length}",
-            f"--threads {args.threads}",
-            f"--seq_depth {args.seq_depth}",
-            f"--rpkm_lower_limit {args.rpkm_lower_limit}",
-            f"--rpkm_upper_limit {args.rpkm_upper_limit}",
-            f"-o {args.o}",
-            f"--sizeselectiontype {args.sizeselectiontype}"
-        ]
-    if args.seed: cmd_chop += ['--seed', str(args.seed)]
-    if args.fragments: cmd_chop += ['--fragments with_ground_truth']
-    if args.no_fragmentation: cmd_chop += ['--no_fragmentation']
-
-    run_cmd(" ".join(cmd_chop))
-    
-    filename = os.path.basename(args.input_df)
-    
-    base_filename = filename.replace(".tsv.gz", "")
     output_prefix = f"{args.o}/reads/{base_filename}"
     chopped_coordinates_file_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_fragments.tsv"
+    chopped_bg_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_background_fragments.tsv"
     rates_for_gene = f"{args.o}/rate_per_gene/{base_filename}_RatesandTraversalTimes.gtf"
-    
+    path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
+    nascent_pool_path, bg_pool_path, units_path = pool_paths(args.o, base_filename)
+    offset_bg = 10_000_000
+
     gtf_path = os.path.join(args.o, "gtf", f"{base_filename}.tsv.gz")
-    if os.path.exists(gtf_path):
-        df_gtf = pd.read_csv(gtf_path, sep="\t")
-        df_gtf = df_gtf.sort_values('position')
-        
-        ref_seq_full = "".join(df_gtf['sequence'].astype(str).tolist())
-        ref_arr = np.array(list(ref_seq_full), dtype='U1')
-        
-        is_bg_spliced = True
-        path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
-        
-        if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
-            try:
-                peek_df = pd.read_csv(path_to_BGmRNAs, delimiter="\t", nrows=1)
-                if 'sequence_length' in peek_df.columns and peek_df.iloc[0]['sequence_length'] == len(ref_seq_full):
-                    is_bg_spliced = False
-            except:
-                pass
-                
-        if is_bg_spliced:
-            exon_gtf = df_gtf[df_gtf['feature'] == 'exon']
-            bg_ref_seq_spliced = "".join(exon_gtf['sequence'].astype(str).tolist())
-            bg_ref_arr = np.array(list(bg_ref_seq_spliced), dtype='U1')
-            gene_length = exon_gtf["sequence"].str.len().sum() / 1000
-        else:
-            bg_ref_arr = ref_arr.copy()
-            gene_length = len(ref_seq_full) / 1000
-    else:
+    if not os.path.exists(gtf_path):
         exit(1)
 
-    df_ref_raw = pd.read_csv(args.input_df, delimiter="\t")
+    if args.prepare:
+        run_chopper(args.input_df, args, args.fragments)
+        nascent_pool = explode_fragments(chopped_coordinates_file_path)
+        if args.experiment_type != 'chromatin_associated' and not nascent_pool.empty:
+            incorporated = pd.read_csv(args.input_df, delimiter="\t", usecols=['incorporated_positions'])['incorporated_positions'].apply(safe_eval)
+            labeled_ids = np.flatnonzero(incorporated.map(len).values > 0) + 1
+            nascent_pool = nascent_pool[nascent_pool['transcript_id'].isin(labeled_ids)]
+
+        bg_pool = pd.DataFrame(columns=nascent_pool.columns)
+        bg_molecules = 0
+        if args.bkg_molecules > 0.0 and count_rows(path_to_BGmRNAs) > 0:
+            run_chopper(path_to_BGmRNAs, args, False)
+            bg_pool = explode_fragments(chopped_bg_path)
+            bg_molecules = count_rows(path_to_BGmRNAs)
+
+        nascent_pool.to_csv(nascent_pool_path, sep="\t", index=False)
+        bg_pool.to_csv(bg_pool_path, sep="\t", index=False)
+        write_units(units_path, base_filename, len(nascent_pool), len(bg_pool), bg_molecules)
+        remove_paths([chopped_coordinates_file_path, chopped_bg_path])
+        sys.exit(0)
+
+    ref_arr, bg_ref_arr = gene_references(gtf_path, path_to_BGmRNAs)
+
+    df_ref_raw = read_pool(args.input_df)
     clean_ref_dict = {}
     
     for col in ['converted_positions', 'incorporated_positions', 'seq_err_positions', 'spliced_introns']:
@@ -319,126 +288,29 @@ if __name__ == "__main__":
         }
     del df_ref_raw 
 
-    try:
-        df_frags = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
-        df_frags['read_coordinates'] = df_frags['read_coordinates'].astype(str).str.split(',')
-        df_exploded = df_frags.explode('read_coordinates').reset_index(drop=True)
-        
-        coord_split = df_exploded['read_coordinates'].str.split('-', expand=True)
-        df_exploded['read_start'] = pd.to_numeric(coord_split[0], errors='coerce')
-        df_exploded['read_end'] = pd.to_numeric(coord_split[1], errors='coerce')
-        df_exploded = df_exploded.dropna(subset=['read_start', 'read_end'])
-    except (FileNotFoundError, pd.errors.EmptyDataError, KeyError):
-        df_exploded = pd.DataFrame(columns=['transcript_id', 'read_start', 'read_end'])
+    df_gene_final = sample_rows(read_pool(nascent_pool_path), args.nascent_reads)
+    df_bg_final = sample_rows(read_pool(bg_pool_path), args.bkg_reads)
 
-    gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
-    
-    
-    temp_dir_rpkm = os.path.join(args.o, "temp")
-    os.makedirs(temp_dir_rpkm, exist_ok=True)
-    rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
-    
-    df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
-    df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
-    
-
-    seq_depth_million = args.seq_depth / 1e6
-    
-    total_reads_budget = int(gene_length * gene_rpkm * seq_depth_million)
-    
-    if args.bkg_molecules > 0.0:
-        reads_to_get_bg = int(total_reads_budget * args.bkg_molecules)
-        reads_to_get_gene = total_reads_budget - reads_to_get_bg
-        if reads_to_get_gene < 0: 
-            reads_to_get_gene = 0
-            reads_to_get_bg = total_reads_budget
-    else:
-        reads_to_get_bg = 0
-        reads_to_get_gene = total_reads_budget
-
-    if not df_exploded.empty and reads_to_get_gene > 0:
-        if len(df_exploded) >= reads_to_get_gene:
-            df_gene_final = df_exploded.sample(n=reads_to_get_gene, replace=False)
-        else:
-            remainder = reads_to_get_gene - len(df_exploded)
-            if remainder > 0:
-                sampled_remainder = df_exploded.sample(n=remainder, replace=True)
-                df_gene_final = pd.concat([df_exploded, sampled_remainder], ignore_index=True)
+    if not df_bg_final.empty:
+        df_bg_final = df_bg_final.assign(transcript_id=df_bg_final['transcript_id'] + offset_bg)
+        df_bg_ref = pd.read_csv(path_to_BGmRNAs, delimiter="\t")
+        for col in ['seq_err_positions', 'converted_positions', 'incorporated_positions', 'spliced_introns']:
+            if col in df_bg_ref.columns:
+                df_bg_ref[col] = df_bg_ref[col].apply(safe_eval)
             else:
-                df_gene_final = df_exploded
-    else:
-        df_gene_final = pd.DataFrame()
-
-    df_bg_final = pd.DataFrame()
-    
-    if reads_to_get_bg > 0:
-        path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
+                df_bg_ref[col] = [[] for _ in range(len(df_bg_ref))]
         
-        if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
-            
-            cmd_chop_bg = [
-                f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
-                "--mode normal",
-                f"--tsv {path_to_BGmRNAs}",
-                f"--insert_size {args.insert_size}",
-                f"--read_length {args.read_length}",
-                f"--threads {args.threads}",
-                f"--seq_depth {args.seq_depth}",
-                f"--rpkm_lower_limit {args.rpkm_lower_limit}",
-                f"--rpkm_upper_limit {args.rpkm_upper_limit}",
-                f"-o {args.o}",
-                f"--sizeselectiontype {args.sizeselectiontype}"
-            ]
-            if args.seed: cmd_chop_bg += ['--seed', str(args.seed)]
-            if args.no_fragmentation: cmd_chop_bg += ['--no_fragmentation']
-
-            run_cmd(" ".join(cmd_chop_bg))
-            
-            offset_bg = 10_000_000 
-            
-            df_bg_ref = pd.read_csv(path_to_BGmRNAs, delimiter="\t")
-            for col in ['seq_err_positions', 'converted_positions', 'incorporated_positions', 'spliced_introns']:
-                if col in df_bg_ref.columns:
-                    df_bg_ref[col] = df_bg_ref[col].apply(safe_eval)
-                else:
-                    df_bg_ref[col] = [[] for _ in range(len(df_bg_ref))]
-            
-            df_bg_ref['transcript_id'] = range(1, len(df_bg_ref) + 1)
-            for _, row in df_bg_ref.iterrows():
-                clean_ref_dict[row['transcript_id'] + offset_bg] = {
-                    'conv': row['converted_positions'],
-                    'inc': row['incorporated_positions'],
-                    'err': row['seq_err_positions'],
-                    'spliced_introns': row['spliced_introns'],
-                    'mol_id': str(row['molecule_id']) + "_BG_",
-                    'start_offset': row['start_label_pos'] if 'start_label_pos' in row else 0
-                }
-            del df_bg_ref
-
-            chopped_bg_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_background_fragments.tsv"
-            try:
-                df_bg = pd.read_csv(chopped_bg_path, delimiter="\t")
-                if not df_bg.empty:
-                    df_bg['transcript_id'] = pd.to_numeric(df_bg['transcript_id'], errors='coerce')
-                    df_bg = df_bg.dropna(subset=['transcript_id'])
-                    df_bg['transcript_id'] = df_bg['transcript_id'].astype(int) + offset_bg
-                    
-                    df_bg['read_coordinates'] = df_bg['read_coordinates'].astype(str).str.split(',')
-                    df_bg_exploded = df_bg.explode('read_coordinates').reset_index(drop=True)
-                    
-                    coord_split_bg = df_bg_exploded['read_coordinates'].str.split('-', expand=True)
-                    df_bg_exploded['read_start'] = pd.to_numeric(coord_split_bg[0], errors='coerce')
-                    df_bg_exploded['read_end'] = pd.to_numeric(coord_split_bg[1], errors='coerce')
-                    df_bg_exploded = df_bg_exploded.dropna(subset=['read_start', 'read_end'])
-
-                    if len(df_bg_exploded) >= reads_to_get_bg:
-                        df_bg_final = df_bg_exploded.sample(n=reads_to_get_bg, replace=False)
-                    else:
-                        remainder = reads_to_get_bg - len(df_bg_exploded)
-                        sampled_remainder = df_bg_exploded.sample(n=remainder, replace=True)
-                        df_bg_final = pd.concat([df_bg_exploded, sampled_remainder], ignore_index=True)
-            except (FileNotFoundError, pd.errors.EmptyDataError, KeyError):
-                pass
+        df_bg_ref['transcript_id'] = range(1, len(df_bg_ref) + 1)
+        for _, row in df_bg_ref.iterrows():
+            clean_ref_dict[row['transcript_id'] + offset_bg] = {
+                'conv': row['converted_positions'],
+                'inc': row['incorporated_positions'],
+                'err': row['seq_err_positions'],
+                'spliced_introns': row['spliced_introns'],
+                'mol_id': str(row['molecule_id']) + "_BG_",
+                'start_offset': row['start_label_pos'] if 'start_label_pos' in row else 0
+            }
+        del df_bg_ref
 
     df_total = pd.concat([df_gene_final, df_bg_final], ignore_index=True)
     df_total = df_total.sample(frac=1).reset_index(drop=True)
@@ -462,11 +334,4 @@ if __name__ == "__main__":
         ttseq=False
     )
 
-    try:
-        if os.path.exists(chopped_coordinates_file_path):
-            os.remove(chopped_coordinates_file_path)
-        if 'chopped_bg_path' in locals() and os.path.exists(chopped_bg_path):
-            os.remove(chopped_bg_path)
-    except OSError: pass
-
-
+    remove_paths([nascent_pool_path, bg_pool_path, units_path])

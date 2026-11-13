@@ -8,6 +8,8 @@ import string
 import ast
 import numpy as np
 import hashlib
+import sys
+from spark_reads import pool_paths, write_units, read_pool, remove_paths, sample_rows, count_rows, gene_references, coordinate_mapper
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -24,22 +26,8 @@ def reverse_complement(seq):
 def process_sequence(sequence, reverse_comp=False):
     return reverse_complement(sequence) if reverse_comp else sequence
 
-def get_absolute_coords(rates_df, read_start, read_end):
-    if rates_df.empty:
-        return "NA"
-    subset = rates_df[
-        (rates_df['nucleotide_coord'] >= read_start) &
-        (rates_df['nucleotide_coord'] <= read_end)
-    ]
-    if not subset.empty:
-        chrom = subset['chromosome'].iloc[0]
-        abs_start = subset['absolute_position'].iloc[0]
-        abs_end = subset['absolute_position'].iloc[-1]
-        strand = subset['strand'].iloc[0]
-        return f"{chrom}:{abs_start}-{abs_end}:{strand}"
-    return "NA"
-
 def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, read_length, rates_df, ref_arr, bg_ref_arr):
+    to_absolute = coordinate_mapper(rates_df)
     if sequencing_type == "SE":
         output_file = f"{output_prefix}.fastq.gz"
         with gzip.open(output_file, 'wt') as f:
@@ -63,20 +51,20 @@ def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, re
                 if strandedness == "rf":
                     seq = "".join(current_ref[d_start:r_end])
                     rev = True
-                    abs_coords = get_absolute_coords(rates_df, d_start, r_end - 1)
+                    abs_coords = to_absolute(d_start, r_end - 1)
                 elif strandedness == "fr":
                     seq = "".join(current_ref[r_start:u_end])
                     rev = False
-                    abs_coords = get_absolute_coords(rates_df, r_start, u_end - 1)
+                    abs_coords = to_absolute(r_start, u_end - 1)
                 elif strandedness == "unstranded":
                     if random.choice([True, False]):
                         seq = "".join(current_ref[d_start:r_end])
                         rev = True
-                        abs_coords = get_absolute_coords(rates_df, d_start, r_end - 1)
+                        abs_coords = to_absolute(d_start, r_end - 1)
                     else:
                         seq = "".join(current_ref[r_start:u_end])
                         rev = False
-                        abs_coords = get_absolute_coords(rates_df, r_start, u_end - 1)
+                        abs_coords = to_absolute(r_start, u_end - 1)
 
                 seq = process_sequence(seq, reverse_comp=rev)
                 if not seq: continue
@@ -114,24 +102,24 @@ def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, re
                 if strandedness == "rf":
                     seq_r1 = process_sequence(seq_downstream, reverse_comp=True)
                     seq_r2 = process_sequence(seq_upstream, reverse_comp=False)
-                    abs_coords_r1 = get_absolute_coords(rates_df, d_start, r_end - 1)
-                    abs_coords_r2 = get_absolute_coords(rates_df, r_start, u_end - 1)
+                    abs_coords_r1 = to_absolute(d_start, r_end - 1)
+                    abs_coords_r2 = to_absolute(r_start, u_end - 1)
                 elif strandedness == "fr":
                     seq_r1 = process_sequence(seq_upstream, reverse_comp=False)
                     seq_r2 = process_sequence(seq_downstream, reverse_comp=True)
-                    abs_coords_r1 = get_absolute_coords(rates_df, r_start, u_end - 1)
-                    abs_coords_r2 = get_absolute_coords(rates_df, d_start, r_end - 1)
+                    abs_coords_r1 = to_absolute(r_start, u_end - 1)
+                    abs_coords_r2 = to_absolute(d_start, r_end - 1)
                 elif strandedness == "unstranded":
                     if random.choice([True, False]):
                         seq_r1 = process_sequence(seq_downstream, reverse_comp=True)
                         seq_r2 = process_sequence(seq_upstream, reverse_comp=False)
-                        abs_coords_r1 = get_absolute_coords(rates_df, d_start, r_end - 1)
-                        abs_coords_r2 = get_absolute_coords(rates_df, r_start, u_end - 1)
+                        abs_coords_r1 = to_absolute(d_start, r_end - 1)
+                        abs_coords_r2 = to_absolute(r_start, u_end - 1)
                     else:
                         seq_r1 = process_sequence(seq_upstream, reverse_comp=False)
                         seq_r2 = process_sequence(seq_downstream, reverse_comp=True)
-                        abs_coords_r1 = get_absolute_coords(rates_df, r_start, u_end - 1)
-                        abs_coords_r2 = get_absolute_coords(rates_df, d_start, r_end - 1)
+                        abs_coords_r1 = to_absolute(r_start, u_end - 1)
+                        abs_coords_r2 = to_absolute(d_start, r_end - 1)
 
                 if not seq_r1 or not seq_r2: continue
 
@@ -142,6 +130,20 @@ def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, re
                 f1.write(f"{read_name_r1}\n{seq_r1}\n+\n{'I'*len(seq_r1)}\n")
                 f2.write(f"{read_name_r2}\n{seq_r2}\n+\n{'I'*len(seq_r2)}\n")
 
+def run_chopper(tsv_path, args):
+    cmd_chop = [
+        f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
+        "--mode proseq",
+        f"--tsv {tsv_path}",
+        f"--insert_size {args.insert_size}",
+        f"--read_length {args.read_length}",
+        f"--threads {args.threads}",
+        f"-o {args.o}"
+    ]
+    if args.seed is not None:
+        cmd_chop += ['--seed', str(args.seed)]
+    run_cmd(" ".join(cmd_chop))
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_df")
@@ -149,13 +151,13 @@ if __name__ == "__main__":
     parser.add_argument("--read_length", type=int, default=100)
     parser.add_argument("--seq_type", choices=["PE", "SE"], type=str, default='SE')
     parser.add_argument("--s", choices=["rf", "fr", "unstranded"], type=str, default='rf')
-    parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
-    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument('--bkg_molecules', type=float, default=0)
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--prepare", action="store_true", help="build the fragment pools and count them instead of writing reads")
+    parser.add_argument("--nascent_reads", type=int, default=0)
+    parser.add_argument("--bkg_reads", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -169,119 +171,42 @@ if __name__ == "__main__":
         random.seed(unique_seed)
         np.random.seed(unique_seed)
 
-    cmd_chop = [
-        f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
-        "--mode proseq",
-        f"--tsv {args.input_df}",
-        f"--insert_size {args.insert_size}",
-        f"--read_length {args.read_length}",
-        f"--threads {args.threads}",
-        f"--seq_depth {args.seq_depth}",
-        f"--rpkm_lower_limit {args.rpkm_lower_limit}",
-        f"--rpkm_upper_limit {args.rpkm_upper_limit}",
-        f"-o {args.o}"
-    ]
-    if args.seed:
-        cmd_chop += ['--seed', str(args.seed)]
-    run_cmd(" ".join(cmd_chop))
-
     output_prefix = f"{args.o}/reads/{base_filename}"
     chopped_coordinates_file_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_fragments.tsv"
+    chopped_coordinates_BG_file_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_background_fragments.tsv"
+    path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
+    nascent_pool_path, bg_pool_path, units_path = pool_paths(args.o, base_filename)
 
     gtf_path = f"{args.o}/gtf/{base_filename}.tsv.gz"
-    if os.path.exists(gtf_path):
-        df_gtf = pd.read_csv(gtf_path, delimiter="\t")
-        df_gtf = df_gtf.sort_values('position')
-        
-        ref_seq_full = "".join(df_gtf['sequence'].astype(str).tolist())
-        ref_arr = np.array(list(ref_seq_full), dtype='U1')
-        
-        is_bg_spliced = True
-        path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
-        if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
-            try:
-                peek_df = pd.read_csv(path_to_BGmRNAs, delimiter="\t", nrows=1)
-                if 'sequence_length' in peek_df.columns and peek_df.iloc[0]['sequence_length'] == len(ref_seq_full):
-                    is_bg_spliced = False
-            except:
-                pass
-        
-        if is_bg_spliced:
-            exon_df = df_gtf[df_gtf['feature'] == 'exon'].copy()
-            bg_ref_seq_spliced = "".join(exon_df['sequence'].astype(str).tolist())
-            bg_ref_arr = np.array(list(bg_ref_seq_spliced), dtype='U1')
-            gene_length = exon_df["sequence"].str.len().sum() / 1000
-        else:
-            bg_ref_arr = ref_arr.copy()
-            gene_length = len(ref_seq_full) / 1000
-    else:
+    if not os.path.exists(gtf_path):
         exit(1)
 
-    try:
-        df = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
-        result_df = df.copy()
+    if args.prepare:
+        run_chopper(args.input_df, args)
+        nascent_pool = read_pool(chopped_coordinates_file_path)
 
-        if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
-            cmd_chop_bg = [
-                f"python {os.path.join(SCRIPT_DIR, 'short_read_chopper.py')}",
-                "--mode proseq",
-                f"--tsv {path_to_BGmRNAs}",
-                f"--insert_size {args.insert_size}",
-                f"--read_length {args.read_length}",
-                f"--threads {args.threads}",
-                f"-o {args.o}"
-            ]
-            if args.seed:
-                cmd_chop_bg += ['--seed', str(args.seed)]
+        bg_pool = pd.DataFrame()
+        bg_molecules = 0
+        if args.bkg_molecules > 0.0 and count_rows(path_to_BGmRNAs) > 0:
+            run_chopper(path_to_BGmRNAs, args)
+            bg_pool = read_pool(chopped_coordinates_BG_file_path)
+            if not bg_pool.empty:
+                bg_pool['molecule_id'] = bg_pool['molecule_id'].astype(str) + '_BG_'
+            bg_molecules = count_rows(path_to_BGmRNAs)
 
-            run_cmd(" ".join(cmd_chop_bg))
-            chopped_coordinates_BG_file_path = f"{args.o}/temp/mRNAs_with_fragments/{base_filename}_background_fragments.tsv"
-            
-            try:
-                df_bg = pd.read_csv(chopped_coordinates_BG_file_path, delimiter="\t")
-                df_bg['molecule_id'] = df_bg['molecule_id'].astype(str) + '_BG_'
-                
-                if 'read_coordinates' in df_bg.columns:
-                    df_bg['read_coordinates'] = df_bg['read_coordinates'].astype(str).str.split(',')
-                    df_bg = df_bg.explode('read_coordinates').reset_index(drop=True)
-                    coord_split = df_bg['read_coordinates'].str.split('-', expand=True)
-                    df_bg['read_start'] = pd.to_numeric(coord_split[0], errors='coerce')
-                    df_bg['read_end'] = pd.to_numeric(coord_split[1], errors='coerce')
-                    df_bg = df_bg.dropna(subset=['read_start', 'read_end'])
+        nascent_pool.to_csv(nascent_pool_path, sep="\t", index=False)
+        bg_pool.to_csv(bg_pool_path, sep="\t", index=False)
+        write_units(units_path, base_filename, len(nascent_pool), len(bg_pool), bg_molecules)
+        remove_paths([chopped_coordinates_file_path, chopped_coordinates_BG_file_path])
+        sys.exit(0)
 
-                if not df_bg.empty and not result_df.empty:
-                    n_bg = int(len(result_df) * args.bkg_molecules)
-                    if n_bg > 0:
-                        if len(df_bg) >= n_bg:
-                            df_bg_sampled = df_bg.sample(n=n_bg, replace=False, random_state=42)
-                        else:
-                            df_bg_sampled = df_bg.sample(n=n_bg, replace=True, random_state=42)
-                    
-                        n_main = int(len(result_df) * (1 - args.bkg_molecules))
-                        result_df = result_df.sample(n=n_main, replace=False, random_state=42)
-                        result_df = pd.concat([result_df, df_bg_sampled]).reset_index(drop=True)
-            except FileNotFoundError:
-                pass
+    result_df = pd.concat([
+        sample_rows(read_pool(nascent_pool_path), args.nascent_reads),
+        sample_rows(read_pool(bg_pool_path), args.bkg_reads),
+    ], ignore_index=True)
 
-        gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
-        
-        
-        temp_dir_rpkm = os.path.join(args.o, "temp")
-        os.makedirs(temp_dir_rpkm, exist_ok=True)
-        rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
-        
-        df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
-        df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
-        
-        
-        seq_depth = args.seq_depth / 1e6
-        reads_to_get = int(gene_length * gene_rpkm * seq_depth)
-
-        if len(result_df) >= reads_to_get:
-            result_df = result_df.sample(n=reads_to_get, replace=False, random_state=None)
-        elif not result_df.empty:
-            sampled_reads = result_df.sample(n=reads_to_get - len(result_df), replace=True, random_state=None)
-            result_df = pd.concat([result_df, sampled_reads], ignore_index=True)
+    if not result_df.empty:
+        ref_arr, bg_ref_arr = gene_references(gtf_path, path_to_BGmRNAs)
 
         rates_for_gene = f"{args.o}/rate_per_gene/{base_filename}_RatesandTraversalTimes.gtf"
         if os.path.exists(rates_for_gene):
@@ -300,15 +225,4 @@ if __name__ == "__main__":
             bg_ref_arr
         )
 
-        try:
-            if os.path.exists(chopped_coordinates_file_path):
-                os.remove(chopped_coordinates_file_path)
-            if 'chopped_coordinates_BG_file_path' in locals() and os.path.exists(chopped_coordinates_BG_file_path):
-                os.remove(chopped_coordinates_BG_file_path)
-        except OSError:
-            pass
-
-    except FileNotFoundError:
-        pass
-
-
+    remove_paths([nascent_pool_path, bg_pool_path, units_path])

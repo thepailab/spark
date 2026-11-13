@@ -7,6 +7,7 @@ import subprocess
 import string
 import numpy as np
 import hashlib
+from spark_reads import pool_paths, write_units, read_pool, remove_paths, sample_rows, gene_references, coordinate_mapper
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,22 +24,8 @@ def reverse_complement(seq):
 def process_sequence(sequence, reverse_comp=False):
     return reverse_complement(sequence) if reverse_comp else sequence
 
-def get_absolute_coords(rates_df, read_start, read_end):
-    if rates_df.empty:
-        return "NA"
-    subset = rates_df[
-        (rates_df['nucleotide_coord'] >= read_start) &
-        (rates_df['nucleotide_coord'] <= read_end)
-    ]
-    if not subset.empty:
-        chrom = subset['chromosome'].iloc[0]
-        abs_start = subset['absolute_position'].iloc[0]
-        abs_end = subset['absolute_position'].iloc[-1]
-        strand = subset['strand'].iloc[0]
-        return f"{chrom}:{abs_start}-{abs_end}:{strand}"
-    return "NA"
-
 def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, read_length, rates_df, ref_arr, bg_ref_arr):
+    to_absolute = coordinate_mapper(rates_df)
     if sequencing_type == "SE":
         output_file = f"{output_prefix}.fastq.gz"
         with gzip.open(output_file, 'wt') as f:
@@ -58,23 +45,23 @@ def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, re
                     d_start = max(frag_start, frag_end - read_length)
                     seq = "".join(current_ref[d_start:frag_end])
                     rev = True
-                    abs_coords = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                    abs_coords = to_absolute(d_start, frag_end - 1)
                 elif strandedness == "fr":
                     u_end = min(frag_start + read_length, frag_end)
                     seq = "".join(current_ref[frag_start:u_end])
                     rev = False
-                    abs_coords = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                    abs_coords = to_absolute(frag_start, u_end - 1)
                 elif strandedness == "unstranded":
                     if random.choice([True, False]):
                         d_start = max(frag_start, frag_end - read_length)
                         seq = "".join(current_ref[d_start:frag_end])
                         rev = True
-                        abs_coords = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                        abs_coords = to_absolute(d_start, frag_end - 1)
                     else:
                         u_end = min(frag_start + read_length, frag_end)
                         seq = "".join(current_ref[frag_start:u_end])
                         rev = False
-                        abs_coords = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                        abs_coords = to_absolute(frag_start, u_end - 1)
 
                 seq = process_sequence(seq, reverse_comp=rev)
                 if not seq: continue
@@ -112,24 +99,24 @@ def process_and_write_fastq(df, output_prefix, sequencing_type, strandedness, re
                 if strandedness == "rf":
                     seq_r1 = process_sequence(seq_downstream, reverse_comp=True)
                     seq_r2 = process_sequence(seq_upstream, reverse_comp=False)
-                    abs_coords_r1 = get_absolute_coords(rates_df, d_start, frag_end - 1)
-                    abs_coords_r2 = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                    abs_coords_r1 = to_absolute(d_start, frag_end - 1)
+                    abs_coords_r2 = to_absolute(frag_start, u_end - 1)
                 elif strandedness == "fr":
                     seq_r1 = process_sequence(seq_upstream, reverse_comp=False)
                     seq_r2 = process_sequence(seq_downstream, reverse_comp=True)
-                    abs_coords_r1 = get_absolute_coords(rates_df, frag_start, u_end - 1)
-                    abs_coords_r2 = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                    abs_coords_r1 = to_absolute(frag_start, u_end - 1)
+                    abs_coords_r2 = to_absolute(d_start, frag_end - 1)
                 elif strandedness == "unstranded":
                     if random.choice([True, False]):
                         seq_r1 = process_sequence(seq_downstream, reverse_comp=True)
                         seq_r2 = process_sequence(seq_upstream, reverse_comp=False)
-                        abs_coords_r1 = get_absolute_coords(rates_df, d_start, frag_end - 1)
-                        abs_coords_r2 = get_absolute_coords(rates_df, frag_start, u_end - 1)
+                        abs_coords_r1 = to_absolute(d_start, frag_end - 1)
+                        abs_coords_r2 = to_absolute(frag_start, u_end - 1)
                     else:
                         seq_r1 = process_sequence(seq_upstream, reverse_comp=False)
                         seq_r2 = process_sequence(seq_downstream, reverse_comp=True)
-                        abs_coords_r1 = get_absolute_coords(rates_df, frag_start, u_end - 1)
-                        abs_coords_r2 = get_absolute_coords(rates_df, d_start, frag_end - 1)
+                        abs_coords_r1 = to_absolute(frag_start, u_end - 1)
+                        abs_coords_r2 = to_absolute(d_start, frag_end - 1)
 
                 if not seq_r1 or not seq_r2: continue
 
@@ -147,12 +134,12 @@ if __name__ == "__main__":
     parser.add_argument("--read_length", type=int, default=100)
     parser.add_argument("--seq_type", choices=["PE", "SE"], type=str, default='SE')
     parser.add_argument("--s", choices=["rf", "fr", "unstranded"], type=str, default='rf')
-    parser.add_argument('--seq_depth', type=int, default=20000000)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument('--rpkm_lower_limit', type=int, default=5)
-    parser.add_argument('--rpkm_upper_limit', type=int, default=200)
     parser.add_argument('--o', type=str, default='./')
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--prepare", action="store_true", help="count the footprint pools instead of writing reads")
+    parser.add_argument("--nascent_reads", type=int, default=0)
+    parser.add_argument("--bkg_reads", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -168,67 +155,32 @@ if __name__ == "__main__":
 
     output_prefix = f"{args.o}/reads/{base_filename}"
     chopped_coordinates_file_path = f"{args.o}/netseqmRNAs/{base_filename}_netseq.tsv.gz"
+    path_to_BGmRNAs = os.path.join(args.o.rstrip('/'), "mRNA", base_filename + "_background.tsv.gz")
+    _, _, units_path = pool_paths(args.o, base_filename)
 
     gtf_path = f"{args.o}/gtf/{base_filename}.tsv.gz"
-    if os.path.exists(gtf_path):
-        df_gtf = pd.read_csv(gtf_path, delimiter="\t")
-        df_gtf = df_gtf.sort_values('position')
-        
-        ref_seq_full = "".join(df_gtf['sequence'].astype(str).tolist())
-        ref_arr = np.array(list(ref_seq_full), dtype='U1')
-        
-        is_bg_spliced = True
-        path_to_BGmRNAs = os.path.join(args.o.rstrip('/'), "mRNA", base_filename + "_background.tsv.gz")
-        
-        if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
-            try:
-                peek_df = pd.read_csv(path_to_BGmRNAs, delimiter="\t", nrows=1)
-                if 'sequence_length' in peek_df.columns and peek_df.iloc[0]['sequence_length'] == len(ref_seq_full):
-                    is_bg_spliced = False
-            except:
-                pass
-                
-        if is_bg_spliced:
-            exon_df = df_gtf[df_gtf['feature'] == 'exon'].copy()
-            bg_ref_seq_spliced = "".join(exon_df['sequence'].astype(str).tolist())
-            bg_ref_arr = np.array(list(bg_ref_seq_spliced), dtype='U1')
-            gene_length = exon_df["sequence"].str.len().sum() / 1000
-        else:
-            bg_ref_arr = ref_arr.copy()
-            gene_length = len(ref_seq_full) / 1000
-    else:
+    if not os.path.exists(gtf_path):
         exit(1)
 
-    try:
-        df = pd.read_csv(chopped_coordinates_file_path, delimiter="\t")
-        
-        gene_rpkm = np.random.uniform(low=int(args.rpkm_lower_limit), high=int(args.rpkm_upper_limit))
-        
-        temp_dir_rpkm = os.path.join(args.o, "temp")
-        os.makedirs(temp_dir_rpkm, exist_ok=True)
-        rpkm_path = os.path.join(temp_dir_rpkm, f"temp_{base_filename}_rpkm.tsv")
-        
-        df_rpkm = pd.DataFrame([{"gene_id": base_filename, "rpkm": gene_rpkm}])
-        df_rpkm.to_csv(rpkm_path, sep="\t", index=False)
+    df = read_pool(chopped_coordinates_file_path)
+    is_bg = df['molecule_id'].astype(str).str.contains('_BG_') if not df.empty else pd.Series(dtype=bool)
+    df_main = df[~is_bg] if not df.empty else df
+    df_bg = df[is_bg] if not df.empty else df
 
-        seq_depth = args.seq_depth / 1e6
-        reads_to_get = gene_length * gene_rpkm * seq_depth
+    if args.prepare:
+        write_units(units_path, base_filename, len(df_main), len(df_bg), len(df_bg))
+        exit(0)
 
-        if len(df) >= reads_to_get:
-            df = df.sample(n=int(reads_to_get), replace=False, random_state=None)
-        else:
-            if len(df) == 0:
-                print("Warning: DataFrame is empty, skipping sampling.")
-            else:
-                sampled_reads = df.sample(n=int(reads_to_get) - len(df), replace=True, random_state=None)
-                df = pd.concat([df, sampled_reads], ignore_index=True)
+    df = pd.concat([sample_rows(df_main, args.nascent_reads), sample_rows(df_bg, args.bkg_reads)], ignore_index=True)
+
+    if not df.empty:
+        ref_arr, bg_ref_arr = gene_references(gtf_path, path_to_BGmRNAs)
 
         rates_for_gene = f"{args.o}/rate_per_gene/{base_filename}_RatesandTraversalTimes.gtf"
         if os.path.exists(rates_for_gene):
             rates_df = pd.read_csv(rates_for_gene, delimiter="\t")
         else:
             rates_df = pd.DataFrame(columns=['nucleotide_coord', 'chromosome', 'absolute_position', 'strand'])
-
 
         process_and_write_fastq(
             df, 
@@ -240,6 +192,5 @@ if __name__ == "__main__":
             ref_arr, 
             bg_ref_arr
         )
-            
-    except FileNotFoundError:
-        pass
+
+    remove_paths([units_path])
