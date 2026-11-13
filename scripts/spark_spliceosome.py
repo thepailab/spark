@@ -308,7 +308,7 @@ if __name__ == "__main__":
                 mRNA_gtf = pd.read_csv(correct_gtf_path, sep="\t", comment="#")
                 
                 if args.nosplicing:
-                    bg_len = mRNA_gtf['sequence'].str.len().sum()
+                    bg_len = mRNA_gtf[mRNA_gtf['feature'] != 'readthrough']['sequence'].str.len().sum()
                 else:
                     bg_len = mRNA_gtf[mRNA_gtf['feature'] == 'exon']['sequence'].str.len().sum()
                 mRNA_df['sequence_length'] = bg_len

@@ -14,6 +14,7 @@ from multiprocessing import Pool
 from spark_labeling import parse_conversion_map
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+POOL_MARGIN = 1.2
 args = None 
 
 PRESETS = {
@@ -76,6 +77,13 @@ PRESETS = {
         "bkg_molecules": 1
     }
 }
+
+def init_worker(shared_args):
+    global args
+    args = shared_args
+
+def worker_pool():
+    return Pool(processes=args.threads, initializer=init_worker, initargs=(args,))
 
 def c_log(msg):
     print(f"[SPARK] {msg}")
@@ -266,7 +274,7 @@ def process_rates_file(tsv):
         f"--promoter_pause_duration {args.promoter_pause_duration}"
     ]
     if args.flat_rates: cmd_rates.append("--flat_rates")
-    if args.seed: cmd_rates.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd_rates.extend(['--seed', str(args.seed)])
     if args.region_size_range: cmd_rates.extend(['--region_size_range', args.region_size_range])
     elif args.num_regions: cmd_rates.extend(['--num_regions', str(args.num_regions)])
     else: raise ValueError("You must provide either --region_size_range or --num_regions")
@@ -274,7 +282,7 @@ def process_rates_file(tsv):
         cmd_rates.append(f"--num_pauses {args.num_pauses}")
     run_cmd(" ".join(cmd_rates))
 
-def process_mrna_file(region_file):
+def process_mrna_file(region_file, mrna_count=None, reuse_parameters=False):
     output_dir = args.o.rstrip("/")
     dir_region_files = f"{output_dir}/rate_per_gene/"
     premRNA_out_dir = os.path.join(output_dir, "pre-mRNA")
@@ -289,7 +297,7 @@ def process_mrna_file(region_file):
     cmd_label = [
         f"python {os.path.join(SCRIPT_DIR, 'mRNA_generator.py')}",
         f"--region_file {region_file}", f"--nt_file {nt_file}",
-        f"--experiment_time {args.experiment_time}", f"--mRNAcount {args.mRNAcount}",
+        f"--experiment_time {args.experiment_time}", f"--mRNAcount {mrna_count or args.mRNAcount}",
         f"--seq_err {args.seq_err}", f"--nt_inc_rate {args.nt_inc_prob}",
         f"--subs_rate {args.subs_prob}", f"--labeling_base {args.labeling_base}",
         f"--bkg_molecules {args.bkg_molecules}", f"--initi_rate {args.initi_rate}",
@@ -301,17 +309,16 @@ def process_mrna_file(region_file):
         f"--genome_fasta {args.genome_fasta}",
         f"--o {premRNA_out_dir}/"
     ]
-    if args.seed: cmd_label.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd_label.extend(['--seed', str(args.seed)])
     if args.drb: cmd_label.append('--drb')
     if args.sub_base: cmd_label.extend(['--sub_base', args.sub_base])
     if args.nosplicing: cmd_label.append("--nosplicing") 
     if args.nocleavage: cmd_label.append("--nocleavage")
     if args.immediate_cleavage: cmd_label.append("--immediate_cleavage")
+    if reuse_parameters: cmd_label.append("--reuse_parameters")
     run_cmd(" ".join(cmd_label))
-    if args.remove_temp:
-        remove_files([os.path.join(dir_region_files, f"{gene_id}_total_pausing_time.tsv")])
 
-def process_chromatin_isolation(mrna_file):
+def process_chromatin_isolation(mrna_file, reuse_parameters=False):
     script_path = os.path.join(SCRIPT_DIR, 'chromatin_isolation.py')
     carna_out_dir = os.path.join(args.o.rstrip('/'), 'caRNA_filtered')
     os.makedirs(carna_out_dir, exist_ok=True)
@@ -322,8 +329,10 @@ def process_chromatin_isolation(mrna_file):
         f"--release_half_life {args.chromatin_release_half_life}",
         f"--o {carna_out_dir}"
     ]
-    if args.seed:
+    if args.seed is not None:
         cmd += ["--seed", str(args.seed)]
+    if reuse_parameters:
+        cmd.append("--reuse_parameters")
         
     run_cmd(" ".join(cmd))
     if args.remove_temp: remove_files([mrna_file])
@@ -344,7 +353,7 @@ def process_splicing(mrna_file):
         f"--intron_half_life {args.intron_half_life}",
         f"--o {args.o.rstrip('/')}"
     ]
-    if args.seed:
+    if args.seed is not None:
         cmd += ["--seed", str(args.seed)]
     if args.nosplicing:
         cmd += ["--nosplicing"]
@@ -357,90 +366,182 @@ def process_splicing(mrna_file):
 def mrna_to_proseq(tsv):
     proseq_mrnas_dirout = os.path.join(args.o.rstrip('/'), "proseqmRNAs")
     cmd = [f"python {os.path.join(SCRIPT_DIR, 'mRNA_to_proseq.py')}", f"--input_df {tsv}", f"--o {proseq_mrnas_dirout}"]
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
     run_cmd(" ".join(cmd))
 
-def proseq_to_fastq(tsv):
-    rpkm_lower, rpkm_upper = map(int, args.rpkm.split(","))
+def read_phase_args(reads):
+    if reads is None:
+        return ["--prepare"]
+    return [f"--nascent_reads {reads[0]}", f"--bkg_reads {reads[1]}"]
+
+def allocate_reads(gene_ids):
+    output_dir = args.o.rstrip('/')
+    rows = []
+    for gene_id in gene_ids:
+        units_path = os.path.join(output_dir, "temp", "pools", f"{gene_id}_units.tsv")
+        cells_path = os.path.join(output_dir, "rate_per_gene", f"{gene_id}_cells.tsv")
+        if not (os.path.exists(units_path) and os.path.exists(cells_path)):
+            logging.warning(f"Read pool or simulated cell count missing for {gene_id}, skipping.")
+            continue
+        row = pd.read_csv(units_path, sep='\t').iloc[0].to_dict()
+        row.update(pd.read_csv(cells_path, sep='\t').iloc[0].to_dict())
+        gtf_df = pd.read_csv(os.path.join(output_dir, "gtf", f"{gene_id}.tsv.gz"), sep='\t')
+        row['exon_kb'] = gtf_df.loc[gtf_df['feature'] == 'exon', 'sequence'].str.len().sum() / 1000
+        row['gene_id'] = gene_id
+        rows.append(row)
+    if not rows:
+        return {}
+    genes = pd.DataFrame(rows)
+
+    nascent_weight = (genes['nascent_units'] / genes['simulated_cells'].where(genes['simulated_cells'] > 0)).fillna(0.0)
+    if args.bkg_molecules < 1.0 and nascent_weight.sum() > 0:
+        nascent_reads = (args.seq_depth * (1 - args.bkg_molecules) * nascent_weight / nascent_weight.sum()).round()
+        bkg_reads = (nascent_reads * args.bkg_molecules / (1 - args.bkg_molecules)).round()
+    else:
+        bkg_weight = (genes['initiations_per_min'] * genes['bg_units'] / genes['bg_molecules'].where(genes['bg_molecules'] > 0)).fillna(0.0)
+        nascent_reads = pd.Series(0.0, index=genes.index)
+        bkg_reads = (args.seq_depth * bkg_weight / bkg_weight.sum()).round() if bkg_weight.sum() > 0 else nascent_reads.copy()
+
+    genes['nascent_reads'] = nascent_reads.astype(int)
+    genes['bkg_reads'] = bkg_reads.astype(int)
+    genes['rpkm'] = ((genes['nascent_reads'] + genes['bkg_reads']) / genes['exon_kb'].where(genes['exon_kb'] > 0) / (args.seq_depth / 1e6)).fillna(0.0)
+
+    temp_dir = os.path.join(output_dir, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    for gene in genes.itertuples():
+        pd.DataFrame([{"gene_id": gene.gene_id, "rpkm": gene.rpkm}]).to_csv(
+            os.path.join(temp_dir, f"temp_{gene.gene_id}_rpkm.tsv"), sep='\t', index=False)
+    c_log(f"Allocated {int(genes['nascent_reads'].sum())} nascent and {int(genes['bkg_reads'].sum())} background reads across {len(genes)} genes")
+    return {gene.gene_id: (int(gene.nascent_reads), int(gene.bkg_reads)) for gene in genes.itertuples()}
+
+def enlargement_factors(allocation):
+    pool_dir = os.path.join(args.o.rstrip('/'), "temp", "pools")
+    factors = {}
+    for gene_id, (nascent_reads, bkg_reads) in allocation.items():
+        units = pd.read_csv(os.path.join(pool_dir, f"{gene_id}_units.tsv"), sep='\t').iloc[0]
+        need = max(nascent_reads / units['nascent_units'] if units['nascent_units'] > 0 else 0.0,
+                   bkg_reads / units['bg_units'] if units['bg_units'] > 0 else 0.0)
+        if need > 1:
+            factors[gene_id] = need * POOL_MARGIN
+    return factors
+
+def resimulate_gene(task):
+    gene_id, factor = task
+    output_dir = args.o.rstrip('/')
+    premRNA_out_dir = os.path.join(output_dir, "pre-mRNA")
+    os.makedirs(premRNA_out_dir, exist_ok=True)
+    region_file = os.path.join(output_dir, "rate_per_gene", f"{gene_id}_VariableElongationRateRegions.gtf")
+    process_mrna_file(region_file, mrna_count=int(np.ceil(args.mRNAcount * factor)), reuse_parameters=True)
+
+    mrna_files = [path for path in (os.path.join(premRNA_out_dir, f"{gene_id}.tsv.gz"),
+                                    os.path.join(premRNA_out_dir, f"{gene_id}_background.tsv.gz")) if os.path.exists(path)]
+    if args.experiment_type == 'chromatin_associated':
+        for path in mrna_files:
+            process_chromatin_isolation(path, reuse_parameters=True)
+        mrna_files = [os.path.join(output_dir, "caRNA_filtered", os.path.basename(path)) for path in mrna_files]
+    for path in mrna_files:
+        process_splicing(path)
+
+def generate_reads(worker, tsv_files, suffix, desc, rebuild_pool=None):
+    gene_ids = [os.path.basename(f).replace(suffix, "") for f in tsv_files]
+    tsv_by_gene = dict(zip(gene_ids, tsv_files))
+    with worker_pool() as pool:
+        list(tqdm(pool.imap_unordered(worker, [(f, None) for f in tsv_files]), total=len(tsv_files), desc=f"{desc} (pools)"))
+    allocation = allocate_reads(gene_ids)
+
+    factors = enlargement_factors(allocation)
+    if factors:
+        c_log(f"{len(factors)} genes need more reads than their molecule pools hold; re-simulating them with up to {max(factors.values()):.1f}x more molecules")
+        with worker_pool() as pool:
+            list(tqdm(pool.imap_unordered(resimulate_gene, factors.items()), total=len(factors), desc=f"{desc} (larger pools)"))
+            if rebuild_pool is not None:
+                mrna_dir = os.path.join(args.o.rstrip('/'), "mRNA")
+                list(pool.imap_unordered(rebuild_pool, [os.path.join(mrna_dir, f"{g}.tsv.gz") for g in factors]))
+            list(pool.imap_unordered(worker, [(tsv_by_gene[g], None) for g in factors]))
+
+    tasks = [(f, allocation[g]) for f, g in zip(tsv_files, gene_ids) if g in allocation]
+    with worker_pool() as pool:
+        list(tqdm(pool.imap_unordered(worker, tasks), total=len(tasks), desc=desc))
+
+def proseq_to_fastq(task):
+    tsv, reads = task
     cmd = [f"python {os.path.join(SCRIPT_DIR, 'fastq_generator_proseq.py')}",
            f"--input_df {tsv}", f"--insert_size {args.insert_size}", f"--read_length {args.read_length}",
-           f"--seq_type {args.seq_type}", f"--threads 1", f"--seq_depth {args.seq_depth}",
-           f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"--s {args.s}", f"--o {args.o.rstrip('/')}/", f"--bkg_molecules {args.bkg_molecules}"]
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+           f"--seq_type {args.seq_type}", f"--threads 1", f"--s {args.s}", f"--o {args.o.rstrip('/')}/", f"--bkg_molecules {args.bkg_molecules}"]
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
+    cmd.extend(read_phase_args(reads))
     run_cmd(" ".join(cmd))
-    if args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace("_proseq.tsv.gz", ""))
+    if reads is not None and args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace("_proseq.tsv.gz", ""))
 
 def mrna_to_netseq(tsv):
     netseq_mrnas_dirout = os.path.join(args.o.rstrip('/'), "netseqmRNAs")
     cmd = [f"python {os.path.join(SCRIPT_DIR, 'mRNA_to_netseq.py')}", f"--input_df {tsv}", f"--o {netseq_mrnas_dirout}", f"--bkg_molecules {args.bkg_molecules}"]
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
     run_cmd(" ".join(cmd))
     
-def netseq_to_fastq(tsv):
-    rpkm_lower, rpkm_upper = map(int, args.rpkm.split(","))
+def netseq_to_fastq(task):
+    tsv, reads = task
     cmd = [f"python {os.path.join(SCRIPT_DIR, 'fastq_generator_netseq.py')}",
            f"--input_df {tsv}", f"--insert_size {args.insert_size}", f"--read_length {args.read_length}",
-           f"--seq_type {args.seq_type}", f"--threads 1", f"--seq_depth {args.seq_depth}",
-           f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"--s {args.s}", f"--o {args.o.rstrip('/')}/"]
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+           f"--seq_type {args.seq_type}", f"--threads 1", f"--s {args.s}", f"--o {args.o.rstrip('/')}/"]
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
+    cmd.extend(read_phase_args(reads))
     run_cmd(" ".join(cmd))
-    if args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace("_netseq.tsv.gz", ""))
+    if reads is not None and args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace("_netseq.tsv.gz", ""))
 
-def nascent_to_fastq(tsv):
+def nascent_to_fastq(task):
+    tsv, reads = task
     output_dir = args.o.rstrip('/')
-    rpkm_lower, rpkm_upper = map(int, args.rpkm.split(","))
     if args.seq_tech == "longread":
         cmd = [f"python {os.path.join(SCRIPT_DIR, 'fastq_generator_long_read.py')}",
-               f"--input_df {tsv}", f"--seq_type {args.seq_type}", f"--seq_depth {args.seq_depth}",
-               f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"-o {output_dir}",
-               f"--bkg_molecules {args.bkg_molecules}"]
+               f"--input_df {tsv}", f"--seq_type {args.seq_type}", f"-o {output_dir}",
+               f"--bkg_molecules {args.bkg_molecules}", f"--experiment_type {args.experiment_type}"]
     else: 
         cmd = [f"python {os.path.join(SCRIPT_DIR, 'fastq_generator_short_read.py')}",
                f"--input_df {tsv}", f"--insert_size {args.insert_size}", f"--read_length {args.read_length}",
-               f"--seq_type {args.seq_type}", f"--threads 1", f"--seq_depth {args.seq_depth}",
-               f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"--s {args.s}", f"--o {output_dir}/", f"--experiment_time {args.experiment_time}", f"--bkg_molecules {args.bkg_molecules}"]
+               f"--seq_type {args.seq_type}", f"--threads 1", f"--s {args.s}", f"--o {output_dir}/", f"--experiment_time {args.experiment_time}", f"--bkg_molecules {args.bkg_molecules}"]
         if args.fragments: cmd.append('--fragments')
         if args.sizeselectiontype: cmd.extend(["--sizeselectiontype", args.sizeselectiontype])
         if args.no_fragmentation: cmd.append("--no_fragmentation")
     cmd.extend(labeling_args())
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
+    cmd.extend(read_phase_args(reads))
     run_cmd(" ".join(cmd))
-    if args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace(".tsv.gz", ""))
+    if reads is not None and args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace(".tsv.gz", ""))
 
-def ttseq_to_fastq(tsv):
-    rpkm_lower, rpkm_upper = map(int, args.rpkm.split(","))
+def ttseq_to_fastq(task):
+    tsv, reads = task
     cmd = [f"python {os.path.join(SCRIPT_DIR, 'mRNA_to_reads_ttseq.py')}",
            f"--input_df {tsv}", f"--insert_size {args.insert_size}", f"--read_length {args.read_length}",
-           f"--seq_type {args.seq_type}", f"--threads 1", f"--seq_depth {args.seq_depth}",
-           f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"--s {args.s}", f"--o {args.o.rstrip('/')}/", f"--bkg_molecules {args.bkg_molecules}"]
+           f"--seq_type {args.seq_type}", f"--threads 1", f"--s {args.s}", f"--o {args.o.rstrip('/')}/", f"--bkg_molecules {args.bkg_molecules}"]
     if args.fragments: cmd.append('--fragments')
     if args.sizeselectiontype: cmd.extend(["--sizeselectiontype", args.sizeselectiontype])
     if args.no_fragmentation: cmd.append("--no_fragmentation")
     cmd.extend(labeling_args())
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
+    cmd.extend(read_phase_args(reads))
     run_cmd(" ".join(cmd))
-    if args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace(".tsv.gz", ""))
+    if reads is not None and args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace(".tsv.gz", ""))
 
-def carna_to_fastq(tsv):
+def carna_to_fastq(task):
+    tsv, reads = task
     output_dir = args.o.rstrip('/')
-    rpkm_lower, rpkm_upper = map(int, args.rpkm.split(","))
     if args.seq_tech == "longread":
         cmd = [f"python {os.path.join(SCRIPT_DIR, 'fastq_generator_long_read.py')}",
-               f"--input_df {tsv}", f"--seq_type {args.seq_type}", f"--seq_depth {args.seq_depth}",
-               f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"-o {output_dir}",
-               f"--bkg_molecules {args.bkg_molecules}"]
+               f"--input_df {tsv}", f"--seq_type {args.seq_type}", f"-o {output_dir}",
+               f"--bkg_molecules {args.bkg_molecules}", f"--experiment_type chromatin_associated"]
     else: 
         cmd = [f"python {os.path.join(SCRIPT_DIR, 'fastq_generator_short_read.py')}",
                f"--input_df {tsv}", f"--insert_size {args.insert_size}", f"--read_length {args.read_length}",
-               f"--seq_type {args.seq_type}", f"--threads 1", f"--seq_depth {args.seq_depth}",
-               f"--rpkm_lower_limit {rpkm_lower}", f"--rpkm_upper_limit {rpkm_upper}", f"--s {args.s}", f"--o {output_dir}/", f"--experiment_time {args.experiment_time}", f"--bkg_molecules {args.bkg_molecules}", f"--experiment_type chromatin_associated"]
+               f"--seq_type {args.seq_type}", f"--threads 1", f"--s {args.s}", f"--o {output_dir}/", f"--experiment_time {args.experiment_time}", f"--bkg_molecules {args.bkg_molecules}", f"--experiment_type chromatin_associated"]
         if args.fragments: cmd.append('--fragments')
         if args.sizeselectiontype: cmd.extend(["--sizeselectiontype", args.sizeselectiontype])
         if args.no_fragmentation: cmd.append("--no_fragmentation")
     cmd.extend(labeling_args())
-    if args.seed: cmd.extend(['--seed', str(args.seed)])
+    if args.seed is not None: cmd.extend(['--seed', str(args.seed)])
+    cmd.extend(read_phase_args(reads))
     run_cmd(" ".join(cmd))
-    if args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace(".tsv.gz", ""))
+    if reads is not None and args.remove_temp: remove_gene_intermediates(os.path.basename(tsv).replace(".tsv.gz", ""))
 
 def main():
     global args
@@ -478,7 +579,7 @@ def main():
     group_rates_per_region.add_argument("--flat_rates", action="store_true", help="all nucleotides have the same elongation rate")
     group_rates_per_region.add_argument('--promoter_pause_position', type=str, default='30,50', help='range of position for TSS pausing')
     group_rates_per_region.add_argument('--promoter_pause_duration', type=str, default='0,0', help='length of promoter pausing in minutes')
-    group_rates_per_region.add_argument('--initi_rate',type=str,default='10,60',help='range of seconds for initiation rate')
+    group_rates_per_region.add_argument('--initi_rate',type=str,default='5,200',help='range of seconds between initiations, sampled log-uniformly per gene. Sets each gene\'s expression')
 
     group_mRNAgeneration.add_argument("--experiment_time", type=int, default=15, help="experiment duration in minutes")
     group_mRNAgeneration.add_argument("--seq_err", default="0.0001,0.0002", help="sequencing error rate")
@@ -486,9 +587,9 @@ def main():
     group_mRNAgeneration.add_argument('--subs_prob',type=str,default='0.95,1',help='range of nucleotide substitution probability if simulating nucleotide recoding')
     group_mRNAgeneration.add_argument('--labeling_base', type=str, default='T', help='base analog(s) incorporated into the nascent RNA. A single base or a comma-separated list, e.g. "T" or "A,T"')
     group_mRNAgeneration.add_argument('--sub_base', type=str, help='identity of the base(s) after conversion, matched positionally to --labeling_base, e.g. "C" or "G,C" (A->G and T->C). A single value is applied to every labeling base. Omit for incorporation without recoding')
-    group_mRNAgeneration.add_argument('--bkg_molecules', type=float, default=0,help='proportion of mRNA molecules made before the start of the experiment (not nascent)')
+    group_mRNAgeneration.add_argument('--bkg_molecules', type=float, default=0,help="fraction of each gene's reads that come from background (non-nascent) molecules")
     group_mRNAgeneration.add_argument("--drb", action="store_true", help="simulate a DRB treatment experiment for transcription synchronization")
-    group_mRNAgeneration.add_argument("--mRNAcount", type=int, default=5000, help="total number of mRNA molecules to simulate, including background if speficied")
+    group_mRNAgeneration.add_argument("--mRNAcount", type=int, default=5000, help="size of the molecule pool simulated per gene, including background if specified. Sets simulation size, not expression")
 
     group_mRNAprocessing.add_argument("--cleavage_half_life", type=str, default="0.1,10.0", help="range of cleavage half-lives in min. Randomly chosen per gene")
     group_mRNAprocessing.add_argument("--chromatin_release_half_life", type=str, default="2.0,5.0", help="Min,Max chromatin release half-life in minutes")
@@ -505,7 +606,6 @@ def main():
     group_seq_tech.add_argument("--seq_type", choices=["RNA", "cDNA", "SE", "PE"], default="SE",help="sequencing type")
     group_seq_tech.add_argument('--seq_depth', type=int, default=20000000, help='total library sequencing depth')
     group_seq_tech.add_argument("--insert_size", type=str, default="200,300", help="length of insert")
-    group_seq_tech.add_argument("--rpkm", type=str, default="5,200", help="range of RPKMs genes can have")
     group_seq_tech.add_argument("--read_length", type=int, default=100, help="length of each read")
     group_seq_tech.add_argument("--s", choices=["rf", "fr", "unstranded"], default="rf", help="library strandedness")
     group_seq_tech.add_argument("--fragments", action="store_true", help="export a ground truth for fragmentation & size selection")
@@ -592,7 +692,7 @@ def main():
             f"-t {args.threads}", f"-c {args.n_gene_clusters}", f"-n {args.n}"
         ]
         if args.protein_coding_only: cmd_seq.append("--protein_coding_only")
-        if args.seed: cmd_seq.extend(['--seed', str(args.seed)])
+        if args.seed is not None: cmd_seq.extend(['--seed', str(args.seed)])
         run_cmd(" ".join(cmd_seq))
         if args.remove_temp:
             remove_files([os.path.join(output_dir, "metrics_per_transcript_df.tsv"),
@@ -605,7 +705,7 @@ def main():
         input_dir = f"{output_dir}/gtf"
         tsv_files = sorted(glob.glob(f"{input_dir}/*.tsv.gz"))
         if not tsv_files: sys.exit(f"No TSV files found in {input_dir}")
-        with Pool(processes=args.threads) as pool:
+        with worker_pool() as pool:
             list(tqdm(pool.imap_unordered(process_rates_file, tsv_files), total=len(tsv_files), desc="Rates per region"))
 
     if args.mode in ["fullpipeline", "mRNAgeneration"]:
@@ -616,7 +716,7 @@ def main():
         premRNA_out_dir = os.path.join(output_dir, "pre-mRNA")
         os.makedirs(premRNA_out_dir, exist_ok=True)
         
-        with Pool(processes=args.threads) as pool:
+        with worker_pool() as pool:
             list(tqdm(pool.imap_unordered(process_mrna_file, region_files), total=len(region_files), desc="Pre-mRNA Gen"))
 
     if args.mode in ["fullpipeline", "mRNAgeneration"]:
@@ -625,7 +725,7 @@ def main():
         if args.experiment_type == 'chromatin_associated':
             c_log("Running Chromatin Isolation...")
             transcript_files_for_isolation = sorted(glob.glob(os.path.join(premRNA_out_dir, "*.tsv.gz")))
-            with Pool(processes=args.threads) as pool:
+            with worker_pool() as pool:
                 list(tqdm(pool.imap_unordered(process_chromatin_isolation, transcript_files_for_isolation), total=len(transcript_files_for_isolation), desc="Chromatin Iso"))
 
             splice_input_dir = os.path.join(output_dir, "caRNA_filtered")
@@ -635,7 +735,7 @@ def main():
         c_log("Processing Splicing Events...")
         logging.info(f"Settings: intron_half_life={args.intron_half_life}, nosplicing={args.nosplicing}")
         transcript_files_for_splicing = sorted(glob.glob(os.path.join(splice_input_dir, "*.tsv.gz")))
-        with Pool(processes=args.threads) as pool:
+        with worker_pool() as pool:
             list(tqdm(pool.imap_unordered(process_splicing, transcript_files_for_splicing), total=len(transcript_files_for_splicing), desc="Splicing"))
         if args.remove_temp:
             sweep_intermediates(output_dir, [("pre-mRNA", "*.tsv.gz"), ("caRNA_filtered", "*.tsv.gz")])
@@ -648,44 +748,39 @@ def main():
         os.makedirs(libraries_out_dir, exist_ok=True)
         
         c_log(f"Generating Sequences ({args.experiment_type})...")
-        logging.info(f"Settings: seq_type={args.seq_type}, seq_depth={args.seq_depth}, insert_size={args.insert_size}, rpkm={args.rpkm}")
+        logging.info(f"Settings: seq_type={args.seq_type}, seq_depth={args.seq_depth}, insert_size={args.insert_size}")
 
     if args.experiment_type == 'proseq' and args.mode in ["fullpipeline", "readgeneration"]:
         proseq_mrnas_dirout = os.path.join(output_dir, "proseqmRNAs")
         os.makedirs(proseq_mrnas_dirout, exist_ok=True)
         tsv_files = [f for f in sorted(glob.glob(os.path.join(output_dir, "mRNA", "*.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
+        with worker_pool() as pool:
             list(tqdm(pool.imap_unordered(mrna_to_proseq, tsv_files), total=len(tsv_files), desc="mRNA -> PROseq"))
         
         proseq_files = [f for f in sorted(glob.glob(os.path.join(proseq_mrnas_dirout, "*_proseq.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
-            list(tqdm(pool.imap_unordered(proseq_to_fastq, proseq_files), total=len(proseq_files), desc="PROseq -> FastQ"))
+        generate_reads(proseq_to_fastq, proseq_files, "_proseq.tsv.gz", "PROseq -> FastQ", rebuild_pool=mrna_to_proseq)
 
     elif args.experiment_type == 'netseq' and args.mode in ["fullpipeline", "readgeneration"]:
         netseq_mrnas_dirout = os.path.join(output_dir, "netseqmRNAs")
         os.makedirs(netseq_mrnas_dirout, exist_ok=True)
         tsv_files = [f for f in sorted(glob.glob(os.path.join(output_dir, "mRNA", "*.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
+        with worker_pool() as pool:
             list(tqdm(pool.imap_unordered(mrna_to_netseq, tsv_files), total=len(tsv_files), desc="mRNA -> NETseq"))
 
         netseq_files = [f for f in sorted(glob.glob(os.path.join(netseq_mrnas_dirout, "*_netseq.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
-            list(tqdm(pool.imap_unordered(netseq_to_fastq, netseq_files), total=len(netseq_files), desc="NETseq -> FastQ"))
+        generate_reads(netseq_to_fastq, netseq_files, "_netseq.tsv.gz", "NETseq -> FastQ", rebuild_pool=mrna_to_netseq)
 
     elif args.experiment_type == 'metaboliclabeling' and args.mode in ["fullpipeline", "readgeneration"]:
         tsv_files = [f for f in sorted(glob.glob(os.path.join(output_dir, "mRNA", "*.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
-            list(tqdm(pool.imap_unordered(nascent_to_fastq, tsv_files), total=len(tsv_files), desc="NascentRNA -> FastQ"))
+        generate_reads(nascent_to_fastq, tsv_files, ".tsv.gz", "NascentRNA -> FastQ")
 
     elif args.experiment_type == 'ttseq' and args.mode in ["fullpipeline", "readgeneration"]:
         tsv_files = [f for f in sorted(glob.glob(os.path.join(output_dir, "mRNA", "*.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
-            list(tqdm(pool.imap_unordered(ttseq_to_fastq, tsv_files), total=len(tsv_files), desc="TTseq -> FastQ"))
+        generate_reads(ttseq_to_fastq, tsv_files, ".tsv.gz", "TTseq -> FastQ")
             
     elif args.experiment_type == 'chromatin_associated' and args.mode in ["fullpipeline", "readgeneration"]:
         tsv_files = [f for f in sorted(glob.glob(os.path.join(output_dir, "mRNA", "*.tsv.gz"))) if "background" not in os.path.basename(f)]
-        with Pool(args.threads) as pool:
-            list(tqdm(pool.imap_unordered(carna_to_fastq, tsv_files), total=len(tsv_files), desc="caRNA -> FastQ"))
+        generate_reads(carna_to_fastq, tsv_files, ".tsv.gz", "caRNA -> FastQ")
             
     if args.mode in ["fullpipeline", "readgeneration"]:
         if not glob.glob(f"{reads_out_dir}/*fastq*"):

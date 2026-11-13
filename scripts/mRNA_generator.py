@@ -53,7 +53,7 @@ def findStopnt_optimized(times_array, cumsum_times_padded, labeling_duration, st
 
 def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx,
                           nt_inc_range, sub_rate_range, seq_err_range,
-                          from_bases, to_base, rng):
+                          from_bases, to_base, rng, label=True):
     stop_safe = min(len(seq_array_ref), read_stop_idx)
     lbl_start_safe = max(0, label_start_idx)
     
@@ -61,7 +61,7 @@ def generate_mutated_read(seq_array_ref, read_stop_idx, label_start_idx,
     incorporated_absolute = []
     converted_absolute = []
     
-    if lbl_start_safe < stop_safe:
+    if label and lbl_start_safe < stop_safe:
         label_view = seq_array_ref[lbl_start_safe:stop_safe]
         from_indices = np.where(np.isin(label_view, from_bases))[0]
         n_candidates = len(from_indices)
@@ -126,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--immediate_cleavage", action="store_true")
     parser.add_argument("--polyA_length", type=str, default="50,150")
     parser.add_argument("--genome_fasta", type=str)
+    parser.add_argument("--reuse_parameters", action="store_true")
 
     args = parser.parse_args()
 
@@ -172,6 +173,7 @@ if __name__ == "__main__":
     
     try:
         gtf_gene = pd.read_csv(gtf_path_in, sep='\t', comment='#')
+        gtf_gene = gtf_gene[gtf_gene['feature'] != 'readthrough']
         if 'pas_coordinate' in gtf_gene.columns:
             PAS_coord = int(gtf_gene['pas_coordinate'].iloc[0])
         else:
@@ -184,10 +186,37 @@ if __name__ == "__main__":
     from_bases, conv_map = parse_conversion_map(args.labeling_base, args.sub_base)
     to_base = args.sub_base if conv_map else None
 
-    low, high = map(int, args.initi_rate.split(","))
-    initiation_interval_sec = rng.integers(low, high + 1)
+    parameters_path = os.path.join(os.path.dirname(args.region_file), f"{base_filename}_parameters.tsv")
+    if args.reuse_parameters and os.path.exists(parameters_path):
+        stored_parameters = pd.read_csv(parameters_path, sep='\t').iloc[0]
+        initiation_interval_sec = float(stored_parameters['initiation_interval_sec'])
+        gene_pas_rate = float(stored_parameters['pas_elongation_rate_nt_per_sec'])
+        gene_cleavage_half_life = float(stored_parameters['cleavage_half_life_sec'])
+    else:
+        low, high = map(float, args.initi_rate.split(","))
+        initiation_interval_sec = float(np.exp(rng.uniform(np.log(low), np.log(high))))
+
+        pas_rate_kb_min = list(map(float, args.pas_elong_rate.split(',')))
+        gene_pas_rate = rng.uniform(pas_rate_kb_min[0] * 1000 / 60, pas_rate_kb_min[1] * 1000 / 60)
+
+        cleavage_hl_range = list(map(float, args.cleavage_half_life.split(',')))
+        if cleavage_hl_range[1] > 0:
+            hl_min, hl_max = cleavage_hl_range[0], cleavage_hl_range[1]
+            sampled_hl_min = rng.uniform(hl_min, hl_max)
+            gene_cleavage_half_life = sampled_hl_min * 60.0
+        else:
+            gene_cleavage_half_life = 0.0
+
+        atomic_to_csv(pd.DataFrame([{
+            "gene_id": base_filename,
+            "initiation_interval_sec": initiation_interval_sec,
+            "pas_elongation_rate_nt_per_sec": gene_pas_rate,
+            "cleavage_half_life_sec": gene_cleavage_half_life,
+        }]), parameters_path, sep="\t", index=False)
+
     initiation_rate_per_sec = 1.0 / initiation_interval_sec
-    
+    base_readthrough_deg_rate_nt_sec = (args.readthrough_deg_rate * 1000) / 60.0
+
     input_path = args.region_file
     pausing_file_path = input_path.replace('_VariableElongationRateRegions.gtf', '_total_pausing_time.tsv')
     total_pausing_times = 0.0
@@ -199,7 +228,7 @@ if __name__ == "__main__":
         pass 
 
     mean_elong_rate = df_nt['rate_for_this_nt'].mean()
-    n_pol_per_unit = (max_transcript_length / mean_elong_rate + total_pausing_times) / (initiation_interval_sec / 60)
+    n_pol_per_unit = cumsum_times_padded[-1] / initiation_interval_sec
     
     bolus_per_unit = 0
     if args.drb:
@@ -303,18 +332,6 @@ if __name__ == "__main__":
 
     time_to_PAS = cumsum_times_padded[PAS_coord] if PAS_coord < len(cumsum_times_padded) else cumsum_times_padded[-1]
     time_to_end = cumsum_times_padded[-1]
-    
-    pas_rate_kb_min = list(map(float, args.pas_elong_rate.split(',')))
-    gene_pas_rate = rng.uniform(pas_rate_kb_min[0] * 1000 / 60, pas_rate_kb_min[1] * 1000 / 60)
-    base_readthrough_deg_rate_nt_sec = (args.readthrough_deg_rate * 1000) / 60.0
-
-    cleavage_hl_range = list(map(float, args.cleavage_half_life.split(',')))
-    if cleavage_hl_range[1] > 0:
-        hl_min, hl_max = cleavage_hl_range[0], cleavage_hl_range[1]
-        sampled_hl_min = rng.uniform(hl_min, hl_max)
-        gene_cleavage_half_life = sampled_hl_min * 60.0
-    else:
-        gene_cleavage_half_life = 0.0
 
     def emit_molecule(physical_start, physical_stop, label_start, mol_id_suffix, polyA_len, init_sec, m_id, time_since_cleaved_sec):
         if physical_start >= physical_stop: return
@@ -323,7 +340,7 @@ if __name__ == "__main__":
         pct_sub, conv_pos, inc_pos, pct_err, err_pos = generate_mutated_read(
             dna_sequence_arr, int(physical_stop), int(eff_label_start),
             nt_incorporation_rate, sub_rate_percent_range, seqerr_range,
-            from_bases, to_base, rng
+            from_bases, to_base, rng, label=args.experiment_type != 'netseq'
         )
         
         spliced_introns_str = f"[[0, {int(physical_start)}]]" if physical_start > 0 else "[]"
@@ -486,10 +503,17 @@ if __name__ == "__main__":
         'incorporated_positions', 'percentage_seq_err', 'seq_err_positions', 'spliced_introns', 'polyA_length', 'time_since_cleaved_min'
     ])
 
-    if len(df_for_export) > nascent_to_simulate:
+    n_emitted = len(df_for_export)
+    if n_emitted > nascent_to_simulate:
         df_for_export = df_for_export.sample(n=nascent_to_simulate, random_state=42)
+    simulated_cells = scaling_factor * len(df_for_export) / n_emitted if n_emitted > 0 else 0.0
 
     atomic_to_csv(df_for_export, output_filename, sep='\t', index=False)
+    atomic_to_csv(pd.DataFrame([{
+        "gene_id": base_filename,
+        "simulated_cells": simulated_cells,
+        "initiations_per_min": 60.0 / initiation_interval_sec,
+    }]), os.path.join(os.path.dirname(args.region_file), f"{base_filename}_cells.tsv"), sep="\t", index=False)
 
     #capture mean seq_err across all nascent molecules for the ground truth
     _mean_seq_err = float(df_for_export['percentage_seq_err'].mean()) if not df_for_export.empty else 0.0
@@ -500,7 +524,7 @@ if __name__ == "__main__":
         
         try:
             if args.nosplicing:
-                bg_len = gtf_gene['sequence'].str.len().sum()
+                bg_len = gtf_gene[gtf_gene['feature'] != 'readthrough']['sequence'].str.len().sum()
             else:
                 exon_gtf = gtf_gene[gtf_gene['feature'] == 'exon']
                 bg_len = exon_gtf['sequence'].str.len().sum()

@@ -80,8 +80,6 @@ if __name__ == "__main__":
         df["frag_len"] = df["fragment_end_pos"] - df["fragment_start_pos"]
         df_valid = df[df["frag_len"] > 10]
         
-        gene_fragment_count = len(df_valid)
-
         for row in df_valid.itertuples():
             f_out.write(
                 f"{row.initiation_time}\t"
@@ -101,28 +99,12 @@ if __name__ == "__main__":
             path_to_BGmRNAs = os.path.join(os.path.dirname(args.o), "mRNA", base_filename + "_background.tsv.gz")
             
             if os.path.exists(path_to_BGmRNAs) and os.path.getsize(path_to_BGmRNAs) > 0:
-                
-                # calculate required background count
-                if gene_fragment_count > 0 and args.bkg_molecules < 1.0:
-                    ratio = args.bkg_molecules / (1.0 - args.bkg_molecules)
-                    reads_to_get_bg = int(gene_fragment_count * ratio)
-                elif args.bkg_molecules >= 1.0:
-                     reads_to_get_bg = 1000 
-                else:
-                    reads_to_get_bg = 0
+                df_bg = pd.read_csv(path_to_BGmRNAs, sep="\t", comment="#")
 
-                if reads_to_get_bg > 0:
-                    print(f"[NET-seq] Adding {reads_to_get_bg} background coordinate footprints...")
-                    
-                    df_bg = pd.read_csv(path_to_BGmRNAs, sep="\t", comment="#")
-                    
-                    if len(df_bg) >= reads_to_get_bg:
-                        bg_sample = df_bg.sample(n=reads_to_get_bg, replace=False)
-                    else:
-                        bg_sample = df_bg.sample(n=reads_to_get_bg, replace=True)
-                    
-                    
-                    for row in bg_sample.itertuples():
+                if not df_bg.empty:
+                    print(f"[NET-seq] Adding {len(df_bg)} background coordinate footprints...")
+
+                    for row in df_bg.itertuples():
                         mol_id = str(row.molecule_id) + '_BG_'
                         
                         # Use the sequence_length column to determine bounds mathematically

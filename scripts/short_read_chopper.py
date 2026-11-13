@@ -4,12 +4,12 @@ this was written to be able to chop acorss seq methods, such that:
 
 tree output modes (--mode) hardcoded into the fastq generators that call thiss cript:
   normal  – used by fastq_generator_short_read.py
-            Collapsed output (transcript_id → "start-end,start-end,..."), writes RPKM,
+            Collapsed output (transcript_id → "start-end,start-end,..."),
             optionally writes coverage ground-truth files.
   proseq  – used by fastq_generator_proseq.py
             Per-row output (transcript_id, molecule_id, read_start, read_end).
   ttseq   – used by mRNA_to_reads_ttseq.py
-            Collapsed output, no RPKM, drops fragments shorter than 10 nt.
+            Collapsed output, drops fragments shorter than 10 nt.
 
 """
 
@@ -139,10 +139,6 @@ def main():
                         help="Read length (kept for CLI compatibility; not used in fragmentation)")
     parser.add_argument("--threads",         type=int, default=1,
                         help="Threads (kept for CLI compatibility)")
-    parser.add_argument("--seq_depth",       type=int, default=20_000_000,
-                        help="Total library sequencing depth (used for RPKM in normal mode)")
-    parser.add_argument("--rpkm_lower_limit", type=int, default=5)
-    parser.add_argument("--rpkm_upper_limit", type=int, default=200)
     parser.add_argument("-o", "--dir_out",   default=".",
                         help="Output directory (same -o as fastq generators)")
     parser.add_argument("--seed",            type=int, default=None)
@@ -268,17 +264,6 @@ def main():
     out_path = os.path.join(frags_dir, f"{out_gene_id}_fragments.tsv")
 
     if args.mode == "normal":
-        gene_length_kb = float(df["sequence_length"].mean()) / 1000.0
-        gene_rpkm       = float(rng.uniform(args.rpkm_lower_limit, args.rpkm_upper_limit))
-        seq_depth_m    = args.seq_depth / 1e6
-        reads_to_get   = gene_length_kb * gene_rpkm * seq_depth_m
-
-        #RPKM temp file (may be overwritten by fastq_generator_short_read.py – that's ok)
-        rpkm_path = os.path.join(temp_dir, f"temp_{out_gene_id}_rpkm.tsv")
-        pd.DataFrame([{"gene_id": out_gene_id, "rpkm": gene_rpkm}]).to_csv(
-            rpkm_path, sep="\t", index=False
-        )
-
         #ground truth if specified
         if args.fragments == "with_ground_truth":
             #oost-size-selection coverage
@@ -291,19 +276,17 @@ def main():
                     sep="\t", index=False
                 )
 
-            #pre-size-selection coverage (scaled to target depth)
+            #pre-size-selection coverage
             if all_starts_list:
                 all_s = np.concatenate(all_starts_list)
                 all_e = np.concatenate(all_ends_list)
-                n_passed = len(sel_starts)
-                scaling  = (reads_to_get / n_passed) if n_passed > 0 else 0.0
                 pos_pre, cov_pre = compute_coverage(all_s, all_e)
-                if len(pos_pre) > 0 and scaling > 0:
+                if len(pos_pre) > 0:
                     gt_pre_dir = os.path.join(dir_out, "ground_truth_pre_size_selection")
                     os.makedirs(gt_pre_dir, exist_ok=True)
                     pd.DataFrame({
                         "position":  pos_pre,
-                        "frequency": (cov_pre * scaling).round().astype(int),
+                        "frequency": cov_pre,
                     }).to_csv(
                         os.path.join(gt_pre_dir, f"{out_gene_id}.tsv.gz"),
                         sep="\t", index=False

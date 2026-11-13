@@ -12,6 +12,7 @@ def main():
     parser.add_argument('--release_half_life', required=True, type=str, help="range of chromatin release half life in minutes (e.g., '2.0,5.0')")
     parser.add_argument('--seed', type=int, default=None, help="random seed")
     parser.add_argument('--o', type=str, default='./', help="output directory")
+    parser.add_argument('--reuse_parameters', action='store_true', help="reuse the gene's stored chromatin release half-life instead of drawing a new one")
     
     args = parser.parse_args()
     
@@ -34,9 +35,19 @@ def main():
         
     df = pd.read_csv(args.input_df, sep='\t')
     
+    parent_dir = os.path.dirname(os.path.abspath(args.o.rstrip('/')))
+    parameters_path = os.path.join(parent_dir, 'rate_per_gene', f"{base_filename}_parameters.tsv")
+    stored_parameters = pd.read_csv(parameters_path, sep='\t') if os.path.exists(parameters_path) else pd.DataFrame([{'gene_id': base_filename}])
+
     #get gene-specific chromatin release half life
-    hl_min, hl_max = map(float, args.release_half_life.split(','))
-    gene_hl = np.random.uniform(hl_min, hl_max)
+    if args.reuse_parameters and 'chromatin_release_half_life_min' in stored_parameters.columns:
+        gene_hl = float(stored_parameters['chromatin_release_half_life_min'].iloc[0])
+    else:
+        hl_min, hl_max = map(float, args.release_half_life.split(','))
+        gene_hl = np.random.uniform(hl_min, hl_max)
+        stored_parameters['chromatin_release_half_life_min'] = gene_hl
+        os.makedirs(os.path.dirname(parameters_path), exist_ok=True)
+        stored_parameters.to_csv(parameters_path, sep='\t', index=False)
     
     
     is_uncleaved = df['molecule_id'].str.endswith('_uncleaved')
@@ -62,7 +73,6 @@ def main():
     final_caRNA_df.to_csv(out_file, sep='\t', index=False, compression='gzip')
     
     #export ground truth to the central temp folder for aggregation
-    parent_dir = os.path.dirname(os.path.abspath(args.o.rstrip('/')))
     temp_dir = os.path.join(parent_dir, 'temp')
     os.makedirs(temp_dir, exist_ok=True)
     
